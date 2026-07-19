@@ -112,9 +112,8 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'q': q.mean(),
         }
 
-    @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
-        """Compute the joint training loss."""
+        """Compute the joint training loss inside the outer update JIT."""
         info = {}
         rng = rng if rng is not None else self.rng
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
@@ -225,9 +224,8 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         )
         return jnp.squeeze(best_actions, axis=-2)
 
-    @jax.jit
     def compute_flow_next_states(self, observations, noises):
-        """Sample next states from the conditional state flow with Euler steps."""
+        """Sample next states inside the caller's outer JIT."""
         if self.config['encoder'] is not None:
             observations = self.network.select('state_stitch_encoder')(observations)
 
