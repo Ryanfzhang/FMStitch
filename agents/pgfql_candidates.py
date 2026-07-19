@@ -13,60 +13,99 @@ from utils.networks import ConditionalActorVectorField, NextStateVectorField, Va
 
 
 class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
-    """PGFQL with value-guided successor-state candidate selection.
+    """PGFQL with batch-vectorized state-action candidate selection.
 
-    Training keeps the original PGFQL state-flow, action-distillation, actor-Q,
-    and critic objectives.  An auxiliary IQL-style expectile value network is
-    learned from dataset state-action pairs.  At inference, the state flow
-    proposes multiple successor states, the value network selects one, and the
-    original one-step action network generates a single action conditioned on
-    the selected state.
+    For each state, the state flow proposes K successor states in parallel and
+    the original one-step actor produces K corresponding actions.  The online
+    double critic selects the candidate with the largest conservative Q score.
+    The same candidate policy is used by actor training, critic targets, and
+    environment interaction.
     """
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
-    @staticmethod
-    def expectile_loss(advantage, expectile):
-        """Return the elementwise asymmetric squared expectile loss."""
-        weight = jnp.where(advantage >= 0, expectile, 1 - expectile)
-        return weight * jnp.square(advantage)
-
-    def value_loss(self, batch, grad_params):
-        """Fit V(s) to an expectile of the target critics on dataset actions."""
-        target_qs = self.network.select('target_critic')(
-            batch['observations'],
-            actions=batch['actions'],
+    def _generate_candidates(self, observations, seed, actor_params=None):
+        """Generate and score K candidates with a single batched network call."""
+        next_state_seed, action_seed = jax.random.split(seed)
+        observation_ndim = len(self.config['ob_dims'])
+        batch_shape = observations.shape[:-observation_ndim]
+        candidate_axis = len(batch_shape)
+        candidate_observation_shape = (
+            *batch_shape,
+            self.config['num_candidates'],
+            *self.config['ob_dims'],
         )
-        target_q = jax.lax.stop_gradient(target_qs.min(axis=0))
-        value = self.network.select('value')(
-            batch['observations'],
-            params=grad_params,
-        )
-        advantage = target_q - value
-        value_loss = self.expectile_loss(
-            advantage,
-            self.config['expectile'],
-        ).mean()
 
-        return value_loss, {
-            'value_loss': value_loss,
-            'v_mean': value.mean(),
-            'v_max': value.max(),
-            'v_min': value.min(),
-            'target_q_mean': target_q.mean(),
-            'adv_mean': advantage.mean(),
+        candidate_observations = jnp.broadcast_to(
+            jnp.expand_dims(observations, axis=candidate_axis),
+            candidate_observation_shape,
+        )
+
+        state_noises = jax.random.normal(
+            next_state_seed,
+            candidate_observation_shape,
+        )
+        candidate_next_observations = self.compute_flow_next_state(
+            candidate_observations,
+            noises=state_noises,
+        )
+
+        action_noises = jax.random.normal(
+            action_seed,
+            (
+                *batch_shape,
+                self.config['num_candidates'],
+                self.config['action_dim'],
+            ),
+        )
+        raw_candidate_actions = self.network.select('actor_onestep_flow')(
+            candidate_observations,
+            action_noises,
+            candidate_next_observations,
+            params=actor_params,
+        )
+        candidate_actions = jnp.clip(raw_candidate_actions, -1, 1)
+
+        candidate_qs = self.network.select('critic')(
+            candidate_observations,
+            actions=candidate_actions,
+        )
+        candidate_scores = candidate_qs.min(axis=0)
+        best_indices = jnp.argmax(candidate_scores, axis=-1)
+
+        gather_indices = jnp.broadcast_to(
+            best_indices[..., None, None],
+            (
+                *batch_shape,
+                1,
+                self.config['action_dim'],
+            ),
+        )
+        best_actions = jnp.take_along_axis(
+            candidate_actions,
+            gather_indices,
+            axis=candidate_axis,
+        )
+        best_actions = jnp.squeeze(best_actions, axis=candidate_axis)
+
+        return {
+            'raw_actions': raw_candidate_actions,
+            'actions': candidate_actions,
+            'scores': candidate_scores,
+            'best_indices': best_indices,
+            'best_actions': best_actions,
         }
 
     def critic_loss(self, batch, grad_params, rng):
-        """Compute the original PGFQL critic loss with one next action."""
+        """Compute a TD loss using the best of K next-action candidates."""
         rng, sample_rng = jax.random.split(rng)
-        next_actions = self._sample_single_action(
+        next_candidates = self._generate_candidates(
             batch['next_observations'],
             seed=sample_rng,
         )
-        next_actions = jnp.clip(next_actions, -1, 1)
+        next_actions = jax.lax.stop_gradient(next_candidates['best_actions'])
 
         next_qs = self.network.select('target_critic')(
             batch['next_observations'],
@@ -77,7 +116,10 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         else:
             next_q = next_qs.mean(axis=0)
 
-        target_q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_q
+        target_q = (
+            batch['rewards']
+            + self.config['discount'] * batch['masks'] * next_q
+        )
         q = self.network.select('critic')(
             batch['observations'],
             actions=batch['actions'],
@@ -90,15 +132,17 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'q_mean': q.mean(),
             'q_max': q.max(),
             'q_min': q.min(),
+            'next_candidate_score_mean': next_candidates['scores'].mean(),
+            'next_best_score_mean': next_candidates['scores'].max(axis=-1).mean(),
         }
 
     def actor_loss(self, batch, grad_params, rng):
-        """Compute the original PGFQL state-flow and actor objectives."""
-        batch_size, action_dim = batch['actions'].shape
+        """Train all K candidates with BC and the selected one with Q guidance."""
+        batch_size, _ = batch['actions'].shape
         _, observation_dim = batch['observations'].shape
         rng, state_noise_rng, time_rng = jax.random.split(rng, 3)
 
-        # Original conditional state-flow matching loss.
+        # Keep the original conditional state-flow matching objective.
         state_noise = jax.random.normal(
             state_noise_rng,
             (batch_size, observation_dim),
@@ -119,40 +163,30 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             jnp.square(predicted_velocity - target_velocity)
         )
 
-        # Original PGFQL action distillation uses a flow-generated successor.
-        rng, next_state_rng = jax.random.split(rng)
-        next_state_noises = jax.random.normal(
-            next_state_rng,
-            (batch_size, observation_dim),
-        )
-        generated_next_observations = self.compute_flow_next_state(
+        # Generate all candidates in one (B, K, ...) batch.  The state flow is
+        # evaluated with stored parameters, so Q guidance cannot exploit it.
+        rng, candidate_rng = jax.random.split(rng)
+        candidates = self._generate_candidates(
             batch['observations'],
-            noises=next_state_noises,
+            seed=candidate_rng,
+            actor_params=grad_params,
         )
 
-        rng, action_noise_rng = jax.random.split(rng)
-        action_noises = jax.random.normal(
-            action_noise_rng,
-            (batch_size, action_dim),
+        # Every candidate receives behavior-distillation gradients.
+        dataset_actions = jnp.expand_dims(batch['actions'], axis=-2)
+        distill_loss = jnp.mean(
+            jnp.square(candidates['raw_actions'] - dataset_actions)
         )
-        actor_actions = self.network.select('actor_onestep_flow')(
-            batch['observations'],
-            action_noises,
-            generated_next_observations,
-            params=grad_params,
-        )
-        distill_loss = jnp.mean(jnp.square(actor_actions - batch['actions']))
 
-        # Original PGFQL directly optimizes the actor through the critic.
-        actor_actions = jnp.clip(actor_actions, -1, 1)
-        qs = self.network.select('critic')(
+        # Only the conservatively selected candidate receives actor Q guidance.
+        selected_qs = self.network.select('critic')(
             batch['observations'],
-            actions=actor_actions,
+            actions=candidates['best_actions'],
         )
-        q = jnp.mean(qs, axis=0)
-        q_loss = -q.mean()
+        selected_q = selected_qs.mean(axis=0)
+        q_loss = -selected_q.mean()
         if self.config['normalize_q_loss']:
-            scale = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
+            scale = jax.lax.stop_gradient(1 / jnp.abs(selected_q).mean())
             q_loss = scale * q_loss
 
         actor_loss = (
@@ -161,33 +195,25 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             + q_loss
         )
 
-        # Keep the original single-sample action MSE logging path.  Candidate
-        # selection must not silently enlarge the training computation graph.
-        logged_actions = self._sample_single_action(
-            batch['observations'],
-            seed=rng,
+        policy_mse = jnp.mean(
+            jnp.square(candidates['best_actions'] - batch['actions'])
         )
-        mse = jnp.mean(jnp.square(logged_actions - batch['actions']))
-
         return actor_loss, {
             'actor_loss': actor_loss,
             'next_ob_flow_loss': state_flow_loss,
             'distill_loss': distill_loss,
             'q_loss': q_loss,
-            'q': q.mean(),
-            'mse': mse,
+            'q': selected_q.mean(),
+            'mse': policy_mse,
+            'candidate_score_mean': candidates['scores'].mean(),
+            'best_score_mean': candidates['scores'].max(axis=-1).mean(),
         }
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
-        """Compute original PGFQL losses plus the auxiliary value loss."""
+        """Compute the multi-candidate PGFQL training objective."""
         info = {}
         rng = rng if rng is not None else self.rng
-
-        value_loss, value_info = self.value_loss(batch, grad_params)
-        for key, value in value_info.items():
-            info[f'value/{key}'] = value
-
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
 
         critic_loss, critic_info = self.critic_loss(
@@ -206,12 +232,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         for key, value in actor_info.items():
             info[f'actor/{key}'] = value
 
-        total_loss = (
-            critic_loss
-            + actor_loss
-            + self.config['value_loss_weight'] * value_loss
-        )
-        return total_loss, info
+        return critic_loss + actor_loss, info
 
     def target_update(self, network, module_name):
         """Soft-update a target network."""
@@ -227,7 +248,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def update(self, batch):
-        """Update PGFQL and the auxiliary expectile value network."""
+        """Update the multi-candidate actor, critic, and state flow."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
@@ -237,97 +258,12 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         self.target_update(new_network, 'critic')
         return self.replace(network=new_network, rng=new_rng), info
 
-    def _sample_single_action(self, observations, seed):
-        """Sample one action exactly as in the original PGFQL."""
-        next_state_seed, _ = jax.random.split(seed)
-        observation_ndim = len(self.config['ob_dims'])
-        batch_shape = observations.shape[:-observation_ndim]
-
-        next_state_noises = jax.random.normal(
-            next_state_seed,
-            (*batch_shape, *self.config['ob_dims']),
-        )
-        generated_next_observations = self.compute_flow_next_state(
-            observations,
-            noises=next_state_noises,
-        )
-
-        action_seed, _ = jax.random.split(next_state_seed)
-        action_noises = jax.random.normal(
-            action_seed,
-            (*batch_shape, self.config['action_dim']),
-        )
-        actions = self.network.select('actor_onestep_flow')(
-            observations,
-            action_noises,
-            generated_next_observations,
-        )
-        return jnp.clip(actions, -1, 1)
-
     @jax.jit
     def sample_actions(self, observations, seed=None, temperature=1.0):
-        """Select a successor with V and generate one PGFQL action from it."""
+        """Return the best of K batch-generated state-action candidates."""
         del temperature
-        next_state_seed, _ = jax.random.split(seed)
-        observation_ndim = len(self.config['ob_dims'])
-        batch_shape = observations.shape[:-observation_ndim]
-        candidate_axis = len(batch_shape)
-        candidate_shape = (
-            *batch_shape,
-            self.config['num_candidates'],
-            *self.config['ob_dims'],
-        )
-
-        candidate_observations = jnp.broadcast_to(
-            jnp.expand_dims(observations, axis=candidate_axis),
-            candidate_shape,
-        )
-        state_noises = jax.random.normal(next_state_seed, candidate_shape)
-        candidate_next_observations = self.compute_flow_next_state(
-            candidate_observations,
-            noises=state_noises,
-        )
-
-        candidate_values = self.network.select('value')(
-            candidate_next_observations,
-        )
-        best_indices = jnp.argmax(candidate_values, axis=-1)
-
-        index_shape = (
-            *batch_shape,
-            1,
-            *([1] * observation_ndim),
-        )
-        gather_shape = (
-            *batch_shape,
-            1,
-            *self.config['ob_dims'],
-        )
-        gather_indices = jnp.broadcast_to(
-            jnp.reshape(best_indices, index_shape),
-            gather_shape,
-        )
-        selected_next_observations = jnp.take_along_axis(
-            candidate_next_observations,
-            gather_indices,
-            axis=candidate_axis,
-        )
-        selected_next_observations = jnp.squeeze(
-            selected_next_observations,
-            axis=candidate_axis,
-        )
-
-        action_seed, _ = jax.random.split(next_state_seed)
-        action_noises = jax.random.normal(
-            action_seed,
-            (*batch_shape, self.config['action_dim']),
-        )
-        actions = self.network.select('actor_onestep_flow')(
-            observations,
-            action_noises,
-            selected_next_observations,
-        )
-        return jnp.clip(actions, -1, 1)
+        candidates = self._generate_candidates(observations, seed=seed)
+        return candidates['best_actions']
 
     @jax.jit
     def compute_flow_next_state(self, observations, noises):
@@ -354,7 +290,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
-        """Create PGFQL plus one IQL-style state-value network."""
+        """Create the original PGFQL networks with candidate batching."""
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -365,17 +301,10 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         encoders = {}
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
-            encoders['value'] = encoder_module()
             encoders['critic'] = encoder_module()
             encoders['state_stitch'] = encoder_module()
             encoders['actor_onestep_flow'] = encoder_module()
 
-        value_def = Value(
-            hidden_dims=config['value_hidden_dims'],
-            layer_norm=config['layer_norm'],
-            num_ensembles=1,
-            encoder=encoders.get('value'),
-        )
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
@@ -396,7 +325,6 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         )
 
         network_info = {
-            'value': (value_def, (ex_observations,)),
             'critic': (critic_def, (ex_observations, ex_actions)),
             'target_critic': (
                 copy.deepcopy(critic_def),
@@ -454,9 +382,7 @@ def get_config():
             tau=0.005,
             q_agg='mean',
             alpha=10.0,
-            expectile=0.7,
-            value_loss_weight=1.0,
-            num_candidates=16,
+            num_candidates=4,
             flow_steps=10,
             normalize_q_loss=False,
             encoder=ml_collections.config_dict.placeholder(str),
