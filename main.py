@@ -47,7 +47,7 @@ config_flags.DEFINE_config_file('agent', 'agents/pgfql.py', lock_config=False)
 
 def main(_):
     # Set up logger.
-    exp_name = "{}_{}_{}".format("IQL", FLAGS.env_name, FLAGS.seed)
+    exp_name = "{}_{}_{}".format(FLAGS.agent["agent_name"], FLAGS.env_name, FLAGS.seed)
     setup_wandb(project='iql', group=FLAGS.run_group, name=exp_name)
 
     exp_name = get_exp_name(FLAGS.seed)
