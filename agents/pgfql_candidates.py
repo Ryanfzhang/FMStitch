@@ -211,12 +211,19 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             candidate_q = candidate_qs.mean(axis=0)
 
         best_indices = jnp.argmax(candidate_q, axis=-1)
+        # ``take_along_axis`` preserves the shape of its indices.  Broadcast
+        # the selected candidate index across the full action dimension;
+        # otherwise this would return (..., 1) instead of (..., action_dim).
+        gather_indices = jnp.broadcast_to(
+            best_indices[..., None, None],
+            (*best_indices.shape, 1, candidate_actions.shape[-1]),
+        )
         best_actions = jnp.take_along_axis(
             candidate_actions,
-            best_indices[..., None, None],
+            gather_indices,
             axis=-2,
         )
-        return best_actions[..., 0, :]
+        return jnp.squeeze(best_actions, axis=-2)
 
     @jax.jit
     def compute_flow_next_states(self, observations, noises):
