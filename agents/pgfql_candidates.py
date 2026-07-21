@@ -1,4 +1,5 @@
 import copy
+from functools import partial
 from typing import Any
 
 import flax
@@ -20,11 +21,11 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
     """PGFQL with transition-density-weighted state candidates.
 
     A state behavior flow p_beta(s' | s) is pretrained separately and then
-    frozen.  During Actor-Critic training it proposes K successor states in a
-    single vectorized batch and evaluates their log densities along the same
-    flow trajectories.  A temperature-softmax over these log densities gives
-    relative support weights.  All K actions receive behavior distillation;
-    their Q guidance and the critic target are weighted by state support.
+    frozen.  The actor and environment rollout retain the original PGFQL
+    single-state, single-action policy.  Only the critic uses K vectorized
+    candidates: their state log densities define a temperature-softmax Bellman
+    target, and a FAC-style penalty lowers Q for candidates whose transition
+    density is below that of the corresponding dataset transition.
     """
 
     rng: Any
@@ -150,15 +151,18 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         observations,
         seed,
         compute_logprob=True,
+        num_candidates=None,
     ):
         """Sample K next states and optionally integrate log densities."""
+        if num_candidates is None:
+            num_candidates = self.config['num_candidates']
         state_seed, divergence_seed = jax.random.split(seed)
         observation_ndim = len(self.config['ob_dims'])
         batch_shape = observations.shape[:-observation_ndim]
         candidate_axis = len(batch_shape)
         candidate_shape = (
             *batch_shape,
-            self.config['num_candidates'],
+            num_candidates,
             *self.config['ob_dims'],
         )
         candidate_observations = jnp.broadcast_to(
@@ -267,9 +271,119 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         next_states = jnp.reshape(flat_next_states, candidate_shape)
         logprobs = jnp.reshape(
             flat_logprobs,
-            (*batch_shape, self.config['num_candidates']),
+            (*batch_shape, num_candidates),
         )
         return candidate_observations, next_states, logprobs
+
+    @partial(jax.jit, static_argnames=('mode',))
+    def logprob_given_next_states(
+        self,
+        observations,
+        next_observations_final,
+        rng=None,
+        mode='hutch-rade',
+    ):
+        """Evaluate log p_beta(s' | s) for dataset transitions."""
+        leading_shape = next_observations_final.shape[:-1]
+        state_dim = next_observations_final.shape[-1]
+        flat_observations = jnp.reshape(
+            observations,
+            (-1, state_dim),
+        )
+        flat_next_observations = jnp.reshape(
+            next_observations_final,
+            (-1, state_dim),
+        )
+
+        if self.config['encoder'] is not None:
+            encoded_observations = self.state_network.select(
+                'state_flow_encoder'
+            )(flat_observations)
+        else:
+            encoded_observations = flat_observations
+
+        def velocity_apply(observation_batch, state_batch, time_batch):
+            return self.state_network.select('state_flow')(
+                observation_batch,
+                state_batch,
+                time_batch,
+                is_encoded=True,
+            )
+
+        if mode == 'exact':
+            divergence_fn = self.make_divergence_exact(velocity_apply)
+            divergence_keys = None
+        elif mode in ('hutch-rade', 'hutch-gaus'):
+            if rng is None:
+                raise ValueError('rng is required for Hutchinson divergence')
+            divergence_fn = self.make_divergence_hutchinson(
+                velocity_apply,
+                probes=self.config['logp_hutch_probes'],
+                gaussian=(mode == 'hutch-gaus'),
+            )
+            divergence_keys = jax.random.split(
+                rng,
+                self.config['flow_steps']
+                * flat_next_observations.shape[0],
+            ).reshape(
+                self.config['flow_steps'],
+                flat_next_observations.shape[0],
+                2,
+            )
+        else:
+            raise ValueError(f'Unknown log-density mode: {mode}')
+
+        step_size = 1.0 / self.config['flow_steps']
+        accumulated_divergence = jnp.zeros(
+            (flat_next_observations.shape[0],),
+            dtype=flat_next_observations.dtype,
+        )
+
+        def reverse_euler_step(step, carry):
+            states, log_divergence = carry
+            time = (self.config['flow_steps'] - step) / self.config[
+                'flow_steps'
+            ]
+            times = jnp.full(
+                (states.shape[0], 1),
+                time,
+                dtype=states.dtype,
+            )
+            velocities = velocity_apply(
+                encoded_observations,
+                states,
+                times,
+            )
+            if divergence_keys is None:
+                divergences = divergence_fn(
+                    encoded_observations,
+                    states,
+                    times[:, 0],
+                )
+            else:
+                divergences = divergence_fn(
+                    encoded_observations,
+                    states,
+                    times[:, 0],
+                    divergence_keys[step],
+                )
+            return (
+                states - velocities * step_size,
+                log_divergence + divergences * step_size,
+            )
+
+        base_states, accumulated_divergence = jax.lax.fori_loop(
+            0,
+            self.config['flow_steps'],
+            reverse_euler_step,
+            (flat_next_observations, accumulated_divergence),
+        )
+        base_logprob = (
+            -0.5 * jnp.sum(jnp.square(base_states), axis=-1)
+            - 0.5 * state_dim * jnp.log(2 * jnp.pi)
+        )
+        logprob = base_logprob - accumulated_divergence
+        return jnp.reshape(logprob, leading_shape)
 
     def _generate_candidates(
         self,
@@ -277,8 +391,11 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         seed,
         actor_params=None,
         compute_logprob=True,
+        num_candidates=None,
     ):
         """Generate K state-action candidates and state-support weights."""
+        if num_candidates is None:
+            num_candidates = self.config['num_candidates']
         state_seed, action_seed = jax.random.split(seed)
         (
             candidate_observations,
@@ -288,6 +405,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             observations,
             seed=state_seed,
             compute_logprob=compute_logprob,
+            num_candidates=num_candidates,
         )
 
         observation_ndim = len(self.config['ob_dims'])
@@ -296,7 +414,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             action_seed,
             (
                 *batch_shape,
-                self.config['num_candidates'],
+                num_candidates,
                 self.config['action_dim'],
             ),
         )
@@ -344,34 +462,20 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'state_weight_entropy': entropy.mean(),
         }
 
-    def _best_q_action(self, candidates):
-        """Select the highest conservative-ensemble-Q action for evaluation."""
-        candidate_qs = self.network.select('critic')(
-            candidates['observations'],
-            actions=candidates['actions'],
-        )
-        q_scores = candidate_qs.min(axis=0)
-        best_indices = jnp.argmax(q_scores, axis=-1)
-        action_dim = self.config['action_dim']
-        gather_indices = jnp.broadcast_to(
-            best_indices[..., None, None],
-            (*best_indices.shape, 1, action_dim),
-        )
-        best_actions = jnp.take_along_axis(
-            candidates['actions'],
-            gather_indices,
-            axis=-2,
-        ).squeeze(axis=-2)
-        return best_actions, q_scores
-
     # ------------------------------------------------------------------
     # Stage 2: Actor-Critic
     # ------------------------------------------------------------------
     def critic_loss(self, batch, grad_params, rng):
-        """Compute TD loss with a state-density-weighted candidate target."""
+        """Compute a weighted target and FAC-style state-density penalty."""
+        rng, target_rng, penalty_rng, data_logprob_rng = jax.random.split(
+            rng,
+            4,
+        )
+
+        # Ten candidates are used only to estimate the next-state target.
         next_candidates = self._generate_candidates(
             batch['next_observations'],
-            seed=rng,
+            seed=target_rng,
         )
         next_candidate_qs = self.network.select('target_critic')(
             next_candidates['observations'],
@@ -390,18 +494,65 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             batch['rewards']
             + self.config['discount'] * batch['masks'] * next_q
         )
-        q = self.network.select('critic')(
+        q_data = self.network.select('critic')(
             batch['observations'],
             actions=batch['actions'],
             params=grad_params,
         )
-        critic_loss = jnp.square(q - target_q).mean()
+        td_loss = jnp.square(q_data - target_q).mean()
+
+        # FAC-style penalty in transition space.  Compare every generated
+        # transition with the dataset transition under the same conditioning
+        # state, then lower Q only for less likely generated transitions.
+        penalty_candidates = self._generate_candidates(
+            batch['observations'],
+            seed=penalty_rng,
+        )
+        data_transition_logprob = jax.lax.stop_gradient(
+            self.logprob_given_next_states(
+                batch['observations'],
+                batch['next_observations'],
+                rng=data_logprob_rng,
+                mode=self.config['logp_method'],
+            )
+        )
+        logprob_difference = (
+            penalty_candidates['logprobs']
+            - data_transition_logprob[..., None]
+        )
+        penalty_weights = jax.lax.stop_gradient(
+            jnp.where(
+                logprob_difference < 0,
+                -jnp.expm1(logprob_difference),
+                0.0,
+            )
+        )
+        penalty_qs = self.network.select('critic')(
+            penalty_candidates['observations'],
+            actions=penalty_candidates['actions'],
+            params=grad_params,
+        )
+        critic_penalty = self.config['fac_alpha'] * jnp.mean(
+            penalty_weights[None, ...] * penalty_qs
+        )
+        critic_loss = td_loss + critic_penalty
 
         metrics = {
             'critic_loss': critic_loss,
-            'q_mean': q.mean(),
-            'q_max': q.max(),
-            'q_min': q.min(),
+            'td_loss': td_loss,
+            'penalty': critic_penalty,
+            'penalty_weight_mean': penalty_weights.mean(),
+            'penalty_weight_max': penalty_weights.max(),
+            'penalty_active_rate': (penalty_weights > 0).astype(
+                jnp.float32
+            ).mean(),
+            'data_state_logprob_mean': data_transition_logprob.mean(),
+            'penalty_state_logprob_mean': penalty_candidates[
+                'logprobs'
+            ].mean(),
+            'q_mean': q_data.mean(),
+            'q_max': q_data.max(),
+            'q_min': q_data.min(),
             'next_candidate_q_mean': next_candidate_q.mean(),
             'next_weighted_q_mean': next_q.mean(),
         }
@@ -409,56 +560,43 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         return critic_loss, metrics
 
     def actor_loss(self, batch, grad_params, rng):
-        """Distill all K actions and weight their Q guidance by state support."""
-        candidates = self._generate_candidates(
+        """Keep the original PGFQL one-state, one-action actor update."""
+        single_candidate = self._generate_candidates(
             batch['observations'],
             seed=rng,
             actor_params=grad_params,
+            compute_logprob=False,
+            num_candidates=1,
         )
+        raw_action = single_candidate['raw_actions'].squeeze(axis=-2)
+        action = single_candidate['actions'].squeeze(axis=-2)
 
-        dataset_actions = jnp.expand_dims(batch['actions'], axis=-2)
         distill_loss = jnp.mean(
-            jnp.square(candidates['raw_actions'] - dataset_actions)
+            jnp.square(raw_action - batch['actions'])
         )
 
-        candidate_qs = self.network.select('critic')(
-            candidates['observations'],
-            actions=candidates['actions'],
+        action_qs = self.network.select('critic')(
+            batch['observations'],
+            actions=action,
         )
-        candidate_q = candidate_qs.mean(axis=0)
-        weighted_q = jnp.sum(
-            candidates['weights'] * candidate_q,
-            axis=-1,
-        )
-        q_loss = -weighted_q.mean()
+        action_q = action_qs.mean(axis=0)
+        q_loss = -action_q.mean()
         if self.config['normalize_q_loss']:
             scale = jax.lax.stop_gradient(
-                1 / (jnp.abs(weighted_q).mean() + 1e-8)
+                1 / (jnp.abs(action_q).mean() + 1e-8)
             )
             q_loss = scale * q_loss
 
         actor_loss = self.config['alpha'] * distill_loss + q_loss
-        weighted_action_mse = jnp.sum(
-            candidates['weights']
-            * jnp.mean(
-                jnp.square(
-                    candidates['actions'] - dataset_actions
-                ),
-                axis=-1,
-            ),
-            axis=-1,
-        ).mean()
+        action_mse = jnp.mean(jnp.square(action - batch['actions']))
 
-        metrics = {
+        return actor_loss, {
             'actor_loss': actor_loss,
             'distill_loss': distill_loss,
             'q_loss': q_loss,
-            'weighted_q': weighted_q.mean(),
-            'candidate_q_mean': candidate_q.mean(),
-            'mse': weighted_action_mse,
+            'q': action_q.mean(),
+            'mse': action_mse,
         }
-        metrics.update(self._candidate_weight_metrics(candidates))
-        return actor_loss, metrics
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
@@ -511,15 +649,15 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions(self, observations, seed=None, temperature=1.0):
-        """Generate K candidates and return the highest-Q action."""
+        """Keep rollout identical to the one-state, one-action policy."""
         del temperature
-        candidates = self._generate_candidates(
+        single_candidate = self._generate_candidates(
             observations,
             seed=seed,
             compute_logprob=False,
+            num_candidates=1,
         )
-        best_actions, _ = self._best_q_action(candidates)
-        return best_actions
+        return single_candidate['actions'].squeeze(axis=-2)
 
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
@@ -646,6 +784,7 @@ def get_config():
             tau=0.005,
             q_agg='mean',
             alpha=1.0,
+            fac_alpha=1.0,
             num_candidates=10,
             state_flow_epochs=250,
             state_temperature=10.0,
