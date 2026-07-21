@@ -6,7 +6,6 @@ import random
 import time
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import tqdm
 import wandb
@@ -113,74 +112,42 @@ def main(_):
     if FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
-    # Train the conditional behavior flow before Actor-Critic.  These updates
-    # are deliberately outside offline_steps, so offline_steps counts only
-    # Actor-Critic updates.
+    # Train the state behavior flow p_beta(s' | s) before Actor-Critic.  These
+    # updates are deliberately outside offline_steps, so offline_steps counts
+    # only Actor-Critic updates.  The state flow is frozen afterwards.
     if (
         config['agent_name'] == 'pgfql_candidates'
         and FLAGS.restore_path is None
     ):
         if 'visual' in FLAGS.env_name:
-            bc_batch_size = config['batch_size']
+            state_batch_size = config['batch_size']
         elif train_dataset.size < 100000:
-            bc_batch_size = config['batch_size']
+            state_batch_size = config['batch_size']
         elif train_dataset.size < 500000:
-            bc_batch_size = config['batch_size'] * 4
+            state_batch_size = config['batch_size'] * 4
         else:
-            bc_batch_size = config['batch_size'] * 16
+            state_batch_size = config['batch_size'] * 16
 
-        bc_iterations_per_epoch = (
-            train_dataset.size + bc_batch_size - 1
-        ) // bc_batch_size
-        bc_steps = config['bc_epochs'] * bc_iterations_per_epoch
+        state_iterations_per_epoch = (
+            train_dataset.size + state_batch_size - 1
+        ) // state_batch_size
+        state_steps = (
+            config['state_flow_epochs'] * state_iterations_per_epoch
+        )
         for _ in tqdm.tqdm(
-            range(bc_steps),
+            range(state_steps),
             smoothing=0.1,
             dynamic_ncols=True,
-            desc='Train conditional BCFlow',
+            desc='Train state behavior flow',
         ):
-            bc_batch = train_dataset.sample(bc_batch_size)
-            agent, _ = agent.update_bc(bc_batch)
+            state_batch = train_dataset.sample(state_batch_size)
+            agent, _ = agent.update_state_flow(state_batch)
 
-        density_rng = jax.random.PRNGKey(FLAGS.seed + 1)
-        dataset_logprobs = []
-        for start in tqdm.tqdm(
-            range(0, train_dataset.size, bc_batch_size),
-            smoothing=0.1,
-            dynamic_ncols=True,
-            desc='Estimate behavior log-density',
-        ):
-            stop = min(start + bc_batch_size, train_dataset.size)
-            indices = np.arange(start, stop)
-            density_batch = train_dataset.sample(
-                len(indices),
-                idxs=indices,
-            )
-            density_rng, logprob_rng = jax.random.split(density_rng)
-            logprobs = agent.logprob_given_actions(
-                density_batch['observations'],
-                density_batch['next_observations'],
-                density_batch['actions'],
-                rng=logprob_rng,
-                mode=config['logp_method'],
-            )
-            dataset_logprobs.append(np.asarray(logprobs))
-
-        dataset_logprobs = np.concatenate(dataset_logprobs, axis=0)
-        logprob_threshold = np.quantile(
-            dataset_logprobs,
-            config['density_quantile'],
-        )
-        agent = agent.replace(
-            logprob_threshold=jnp.asarray(
-                logprob_threshold,
-                dtype=jnp.float32,
-            )
-        )
         print(
-            'Conditional behavior log-density threshold '
-            f'(quantile={config["density_quantile"]:.2f}): '
-            f'{logprob_threshold:.6f}'
+            'Finished state behavior-flow pretraining: '
+            f'{config["state_flow_epochs"]} epochs, '
+            f'{state_steps} updates. '
+            f'Actor-Critic will now run for {FLAGS.offline_steps} steps.'
         )
 
     # Train agent.
