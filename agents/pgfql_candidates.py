@@ -11,7 +11,6 @@ import optax
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import (
-    ActorVectorField,
     ConditionalActorVectorField,
     NextStateVectorField,
     Value,
@@ -23,18 +22,20 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
     For each state, the state flow proposes K successor states in parallel and
     the original one-step actor produces K corresponding actions.  A separately
-    pretrained and frozen behavior flow selects the action with the largest
-    log p_beta(a | s).  The same candidate policy is used by actor training,
+    pretrained and frozen conditional behavior flow filters candidates using
+    log p_beta(a | s, s').  The online double critic then selects the highest-Q
+    supported candidate.  The same candidate policy is used by actor training,
     critic targets, and environment interaction.
     """
 
     rng: Any
     network: Any
     bc_network: Any
+    logprob_threshold: Any
     config: Any = nonpytree_field()
 
     def bc_loss(self, batch, grad_params, rng):
-        """Train the behavior action flow p_beta(a | s)."""
+        """Train the conditional behavior flow p_beta(a | s, s')."""
         batch_size, action_dim = batch['actions'].shape
         rng, noise_rng, time_rng = jax.random.split(rng, 3)
 
@@ -48,6 +49,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         predicted_velocity = self.bc_network.select('bc_flow')(
             batch['observations'],
             interpolated_actions,
+            batch['next_observations'],
             times,
             params=grad_params,
         )
@@ -58,18 +60,19 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
     def make_divergence_exact(velocity_apply):
         """Return an exact divergence evaluator for an action vector field."""
 
-        def single_divergence(observation, action, time):
+        def single_divergence(observation, next_observation, action, time):
             def velocity_fn(action_input):
                 return velocity_apply(
                     observation[None, ...],
                     action_input[None, ...],
+                    next_observation[None, ...],
                     jnp.reshape(time, (1, 1)),
                 )[0]
 
             jacobian = jax.jacrev(velocity_fn)(action)
             return jnp.trace(jacobian)
 
-        return jax.vmap(single_divergence, in_axes=(0, 0, 0))
+        return jax.vmap(single_divergence, in_axes=(0, 0, 0, 0))
 
     @staticmethod
     def make_divergence_hutchinson(
@@ -79,11 +82,18 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
     ):
         """Return a Hutchinson trace estimator for an action vector field."""
 
-        def single_divergence(observation, action, time, key):
+        def single_divergence(
+            observation,
+            next_observation,
+            action,
+            time,
+            key,
+        ):
             def velocity_fn(action_input):
                 return velocity_apply(
                     observation[None, ...],
                     action_input[None, ...],
+                    next_observation[None, ...],
                     jnp.reshape(time, (1, 1)),
                 )[0]
 
@@ -106,17 +116,18 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             probe_keys = jax.random.split(key, probes)
             return jax.vmap(vector_jacobian_vector)(probe_keys).mean()
 
-        return jax.vmap(single_divergence, in_axes=(0, 0, 0, 0))
+        return jax.vmap(single_divergence, in_axes=(0, 0, 0, 0, 0))
 
     @partial(jax.jit, static_argnames=('mode',))
     def logprob_given_actions(
         self,
         observations,
+        next_observations,
         actions_final,
         rng=None,
         mode='exact',
     ):
-        """Evaluate log p_beta(a | s) with the frozen behavior flow."""
+        """Evaluate log p_beta(a | s, s') with the frozen behavior flow."""
         leading_shape = actions_final.shape[:-1]
         action_dim = actions_final.shape[-1]
         flat_actions = jnp.reshape(actions_final, (-1, action_dim))
@@ -124,18 +135,32 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             observations,
             (-1, *self.config['ob_dims']),
         )
+        flat_next_observations = jnp.reshape(
+            next_observations,
+            (-1, *self.config['ob_dims']),
+        )
 
         if self.config['encoder'] is not None:
             encoded_observations = self.bc_network.select('bc_flow_encoder')(
                 flat_observations
             )
+            encoded_next_observations = self.bc_network.select(
+                'bc_flow_encoder'
+            )(flat_next_observations)
         else:
             encoded_observations = flat_observations
+            encoded_next_observations = flat_next_observations
 
-        def velocity_apply(observation_batch, action_batch, time_batch):
+        def velocity_apply(
+            observation_batch,
+            action_batch,
+            next_observation_batch,
+            time_batch,
+        ):
             return self.bc_network.select('bc_flow')(
                 observation_batch,
                 action_batch,
+                next_observation_batch,
                 time_batch,
                 is_encoded=True,
             )
@@ -180,17 +205,20 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             velocities = velocity_apply(
                 encoded_observations,
                 actions,
+                encoded_next_observations,
                 time_batch,
             )
             if divergence_keys is None:
                 divergences = divergence_fn(
                     encoded_observations,
+                    encoded_next_observations,
                     actions,
                     time_batch[:, 0],
                 )
             else:
                 divergences = divergence_fn(
                     encoded_observations,
+                    encoded_next_observations,
                     actions,
                     time_batch[:, 0],
                     divergence_keys[step],
@@ -214,7 +242,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         return jnp.reshape(logprob, leading_shape)
 
     def _generate_candidates(self, observations, seed, actor_params=None):
-        """Generate K candidates and select the largest behavior log-density."""
+        """Generate K candidates, filter by density, and select by Q."""
         next_state_seed, action_seed, logprob_seed = jax.random.split(seed, 3)
         observation_ndim = len(self.config['ob_dims'])
         batch_shape = observations.shape[:-observation_ndim]
@@ -256,6 +284,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         candidate_logprobs = jax.lax.stop_gradient(
             self.logprob_given_actions(
                 candidate_observations,
+                candidate_next_observations,
                 raw_candidate_actions,
                 rng=logprob_seed,
                 mode=self.config['logp_method'],
@@ -268,7 +297,31 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             actions=candidate_actions,
         )
         candidate_q_scores = candidate_qs.min(axis=0)
-        best_indices = jnp.argmax(candidate_logprobs, axis=-1)
+        supported = candidate_logprobs >= self.logprob_threshold
+        any_supported = jnp.any(supported, axis=-1)
+        supported_q_scores = jnp.where(
+            supported,
+            candidate_q_scores,
+            -jnp.inf,
+        )
+        best_supported_indices = jnp.argmax(supported_q_scores, axis=-1)
+        best_logprob_indices = jnp.argmax(candidate_logprobs, axis=-1)
+        best_indices = jnp.where(
+            any_supported,
+            best_supported_indices,
+            best_logprob_indices,
+        )
+        scalar_gather_indices = best_indices[..., None]
+        selected_logprobs = jnp.take_along_axis(
+            candidate_logprobs,
+            scalar_gather_indices,
+            axis=-1,
+        ).squeeze(axis=-1)
+        selected_q_scores = jnp.take_along_axis(
+            candidate_q_scores,
+            scalar_gather_indices,
+            axis=-1,
+        ).squeeze(axis=-1)
 
         gather_indices = jnp.broadcast_to(
             best_indices[..., None, None],
@@ -290,8 +343,14 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'actions': candidate_actions,
             'logprobs': candidate_logprobs,
             'q_scores': candidate_q_scores,
+            'supported': supported,
+            'supported_count': supported.sum(axis=-1),
+            'fallback': ~any_supported,
+            'all_supported': jnp.all(supported, axis=-1),
             'best_indices': best_indices,
             'best_actions': best_actions,
+            'selected_logprobs': selected_logprobs,
+            'selected_q_scores': selected_q_scores,
         }
 
     def critic_loss(self, batch, grad_params, rng):
@@ -331,6 +390,18 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'next_candidate_logprob_mean': next_candidates['logprobs'].mean(),
             'next_best_logprob_mean': next_candidates['logprobs'].max(axis=-1).mean(),
             'next_candidate_q_mean': next_candidates['q_scores'].mean(),
+            'next_selected_q_mean': next_candidates[
+                'selected_q_scores'
+            ].mean(),
+            'next_supported_count_mean': next_candidates[
+                'supported_count'
+            ].mean(),
+            'next_fallback_rate': next_candidates['fallback'].astype(
+                jnp.float32
+            ).mean(),
+            'next_all_supported_rate': next_candidates[
+                'all_supported'
+            ].astype(jnp.float32).mean(),
         }
 
     def actor_loss(self, batch, grad_params, rng):
@@ -403,8 +474,20 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'q': selected_q.mean(),
             'mse': policy_mse,
             'candidate_logprob_mean': candidates['logprobs'].mean(),
-            'best_logprob_mean': candidates['logprobs'].max(axis=-1).mean(),
+            'selected_logprob_mean': candidates[
+                'selected_logprobs'
+            ].mean(),
             'candidate_q_mean': candidates['q_scores'].mean(),
+            'selected_q_score_mean': candidates[
+                'selected_q_scores'
+            ].mean(),
+            'supported_count_mean': candidates['supported_count'].mean(),
+            'fallback_rate': candidates['fallback'].astype(
+                jnp.float32
+            ).mean(),
+            'all_supported_rate': candidates['all_supported'].astype(
+                jnp.float32
+            ).mean(),
         }
 
     @jax.jit
@@ -451,7 +534,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
-    def _update_bc(self, batch):
+    def update_bc(self, batch):
         """Run one behavior-flow pretraining update."""
         new_rng, rng = jax.random.split(self.rng)
 
@@ -461,11 +544,10 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         new_bc_network, info = self.bc_network.apply_loss_fn(
             loss_fn=loss_fn
         )
-        info['training/phase'] = jnp.array(0.0)
         return self.replace(bc_network=new_bc_network, rng=new_rng), info
 
     @jax.jit
-    def _update_actor_critic(self, batch):
+    def update(self, batch):
         """Update the actor, critic, and state flow with frozen BCFlow."""
         new_rng, rng = jax.random.split(self.rng)
 
@@ -474,18 +556,11 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'critic')
-        info['training/phase'] = jnp.array(1.0)
         return self.replace(network=new_network, rng=new_rng), info
-
-    def update(self, batch):
-        """Automatically run BCFlow pretraining before actor-critic training."""
-        if int(self.bc_network.step) <= self.config['bc_steps']:
-            return self._update_bc(batch)
-        return self._update_actor_critic(batch)
 
     @jax.jit
     def sample_actions(self, observations, seed=None, temperature=1.0):
-        """Return the candidate with the largest behavior log-density."""
+        """Return the highest-Q candidate above the density threshold."""
         del temperature
         candidates = self._generate_candidates(observations, seed=seed)
         return candidates['best_actions']
@@ -584,7 +659,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
         network.params['modules_target_critic'] = network.params['modules_critic']
 
-        bc_flow_def = ActorVectorField(
+        bc_flow_def = ConditionalActorVectorField(
             hidden_dims=config['bc_hidden_dims'],
             action_dim=action_dim,
             layer_norm=config['bc_layer_norm'],
@@ -593,7 +668,12 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         bc_network_info = {
             'bc_flow': (
                 bc_flow_def,
-                (ex_observations, ex_actions, ex_times),
+                (
+                    ex_observations,
+                    ex_actions,
+                    ex_observations,
+                    ex_times,
+                ),
             ),
         }
         if encoders.get('bc_flow') is not None:
@@ -625,6 +705,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             rng,
             network=network,
             bc_network=bc_network,
+            logprob_threshold=jnp.array(-jnp.inf, dtype=jnp.float32),
             config=flax.core.FrozenDict(**config),
         )
 
@@ -647,9 +728,10 @@ def get_config():
             discount=0.99,
             tau=0.005,
             q_agg='mean',
-            alpha=10.0,
+            alpha=1.0,
             num_candidates=4,
-            bc_steps=100000,
+            bc_epochs=250,
+            density_quantile=0.10,
             flow_steps=10,
             logp_method='exact',
             logp_hutch_probes=1,
