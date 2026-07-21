@@ -1,4 +1,5 @@
 import copy
+from functools import partial
 from typing import Any
 
 import flax
@@ -9,26 +10,212 @@ import optax
 
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import ConditionalActorVectorField, NextStateVectorField, Value
+from utils.networks import (
+    ActorVectorField,
+    ConditionalActorVectorField,
+    NextStateVectorField,
+    Value,
+)
 
 
 class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
-    """PGFQL with batch-vectorized state-action candidate selection.
+    """PGFQL with behavior-density-selected state-action candidates.
 
     For each state, the state flow proposes K successor states in parallel and
-    the original one-step actor produces K corresponding actions.  The online
-    double critic selects the candidate with the largest conservative Q score.
-    The same candidate policy is used by actor training, critic targets, and
-    environment interaction.
+    the original one-step actor produces K corresponding actions.  A separately
+    pretrained and frozen behavior flow selects the action with the largest
+    log p_beta(a | s).  The same candidate policy is used by actor training,
+    critic targets, and environment interaction.
     """
 
     rng: Any
     network: Any
+    bc_network: Any
     config: Any = nonpytree_field()
 
+    def bc_loss(self, batch, grad_params, rng):
+        """Train the behavior action flow p_beta(a | s)."""
+        batch_size, action_dim = batch['actions'].shape
+        rng, noise_rng, time_rng = jax.random.split(rng, 3)
+
+        noises = jax.random.normal(noise_rng, (batch_size, action_dim))
+        target_actions = batch['actions']
+        times = jax.random.uniform(time_rng, (batch_size, 1))
+        interpolated_actions = (
+            (1 - times) * noises + times * target_actions
+        )
+        target_velocity = target_actions - noises
+        predicted_velocity = self.bc_network.select('bc_flow')(
+            batch['observations'],
+            interpolated_actions,
+            times,
+            params=grad_params,
+        )
+        loss = jnp.mean(jnp.square(predicted_velocity - target_velocity))
+        return loss, {'bc/flow_loss': loss}
+
+    @staticmethod
+    def make_divergence_exact(velocity_apply):
+        """Return an exact divergence evaluator for an action vector field."""
+
+        def single_divergence(observation, action, time):
+            def velocity_fn(action_input):
+                return velocity_apply(
+                    observation[None, ...],
+                    action_input[None, ...],
+                    jnp.reshape(time, (1, 1)),
+                )[0]
+
+            jacobian = jax.jacrev(velocity_fn)(action)
+            return jnp.trace(jacobian)
+
+        return jax.vmap(single_divergence, in_axes=(0, 0, 0))
+
+    @staticmethod
+    def make_divergence_hutchinson(
+        velocity_apply,
+        probes=1,
+        gaussian=False,
+    ):
+        """Return a Hutchinson trace estimator for an action vector field."""
+
+        def single_divergence(observation, action, time, key):
+            def velocity_fn(action_input):
+                return velocity_apply(
+                    observation[None, ...],
+                    action_input[None, ...],
+                    jnp.reshape(time, (1, 1)),
+                )[0]
+
+            def vector_jacobian_vector(probe_key):
+                _, vector_jacobian_product = jax.vjp(velocity_fn, action)
+                if gaussian:
+                    probe = jax.random.normal(
+                        probe_key,
+                        action.shape,
+                        dtype=action.dtype,
+                    )
+                else:
+                    probe = jax.random.rademacher(
+                        probe_key,
+                        action.shape,
+                        dtype=action.dtype,
+                    )
+                return jnp.dot(vector_jacobian_product(probe)[0], probe)
+
+            probe_keys = jax.random.split(key, probes)
+            return jax.vmap(vector_jacobian_vector)(probe_keys).mean()
+
+        return jax.vmap(single_divergence, in_axes=(0, 0, 0, 0))
+
+    @partial(jax.jit, static_argnames=('mode',))
+    def logprob_given_actions(
+        self,
+        observations,
+        actions_final,
+        rng=None,
+        mode='exact',
+    ):
+        """Evaluate log p_beta(a | s) with the frozen behavior flow."""
+        leading_shape = actions_final.shape[:-1]
+        action_dim = actions_final.shape[-1]
+        flat_actions = jnp.reshape(actions_final, (-1, action_dim))
+        flat_observations = jnp.reshape(
+            observations,
+            (-1, *self.config['ob_dims']),
+        )
+
+        if self.config['encoder'] is not None:
+            encoded_observations = self.bc_network.select('bc_flow_encoder')(
+                flat_observations
+            )
+        else:
+            encoded_observations = flat_observations
+
+        def velocity_apply(observation_batch, action_batch, time_batch):
+            return self.bc_network.select('bc_flow')(
+                observation_batch,
+                action_batch,
+                time_batch,
+                is_encoded=True,
+            )
+
+        if mode == 'exact':
+            divergence_fn = self.make_divergence_exact(velocity_apply)
+            divergence_keys = None
+        elif mode in ('hutch-rade', 'hutch-gaus'):
+            if rng is None:
+                raise ValueError('rng is required for Hutchinson divergence')
+            divergence_fn = self.make_divergence_hutchinson(
+                velocity_apply,
+                probes=self.config['logp_hutch_probes'],
+                gaussian=(mode == 'hutch-gaus'),
+            )
+            divergence_keys = jax.random.split(
+                rng,
+                self.config['flow_steps'] * flat_actions.shape[0],
+            ).reshape(
+                self.config['flow_steps'],
+                flat_actions.shape[0],
+                2,
+            )
+        else:
+            raise ValueError(f'Unknown log-density mode: {mode}')
+
+        integration_steps = self.config['flow_steps']
+        step_size = 1.0 / integration_steps
+        log_divergence = jnp.zeros(
+            (flat_actions.shape[0],),
+            dtype=flat_actions.dtype,
+        )
+
+        def reverse_euler_step(step, carry):
+            actions, accumulated_divergence = carry
+            time = (integration_steps - step) / integration_steps
+            time_batch = jnp.full(
+                (actions.shape[0], 1),
+                time,
+                dtype=actions.dtype,
+            )
+            velocities = velocity_apply(
+                encoded_observations,
+                actions,
+                time_batch,
+            )
+            if divergence_keys is None:
+                divergences = divergence_fn(
+                    encoded_observations,
+                    actions,
+                    time_batch[:, 0],
+                )
+            else:
+                divergences = divergence_fn(
+                    encoded_observations,
+                    actions,
+                    time_batch[:, 0],
+                    divergence_keys[step],
+                )
+            return (
+                actions - velocities * step_size,
+                accumulated_divergence + divergences * step_size,
+            )
+
+        base_actions, log_divergence = jax.lax.fori_loop(
+            0,
+            integration_steps,
+            reverse_euler_step,
+            (flat_actions, log_divergence),
+        )
+        base_logprob = (
+            -0.5 * jnp.sum(jnp.square(base_actions), axis=-1)
+            - 0.5 * action_dim * jnp.log(2 * jnp.pi)
+        )
+        logprob = base_logprob - log_divergence
+        return jnp.reshape(logprob, leading_shape)
+
     def _generate_candidates(self, observations, seed, actor_params=None):
-        """Generate and score K candidates with a single batched network call."""
-        next_state_seed, action_seed = jax.random.split(seed)
+        """Generate K candidates and select the largest behavior log-density."""
+        next_state_seed, action_seed, logprob_seed = jax.random.split(seed, 3)
         observation_ndim = len(self.config['ob_dims'])
         batch_shape = observations.shape[:-observation_ndim]
         candidate_axis = len(batch_shape)
@@ -66,14 +253,22 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             candidate_next_observations,
             params=actor_params,
         )
+        candidate_logprobs = jax.lax.stop_gradient(
+            self.logprob_given_actions(
+                candidate_observations,
+                raw_candidate_actions,
+                rng=logprob_seed,
+                mode=self.config['logp_method'],
+            )
+        )
         candidate_actions = jnp.clip(raw_candidate_actions, -1, 1)
 
         candidate_qs = self.network.select('critic')(
             candidate_observations,
             actions=candidate_actions,
         )
-        candidate_scores = candidate_qs.min(axis=0)
-        best_indices = jnp.argmax(candidate_scores, axis=-1)
+        candidate_q_scores = candidate_qs.min(axis=0)
+        best_indices = jnp.argmax(candidate_logprobs, axis=-1)
 
         gather_indices = jnp.broadcast_to(
             best_indices[..., None, None],
@@ -93,13 +288,14 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         return {
             'raw_actions': raw_candidate_actions,
             'actions': candidate_actions,
-            'scores': candidate_scores,
+            'logprobs': candidate_logprobs,
+            'q_scores': candidate_q_scores,
             'best_indices': best_indices,
             'best_actions': best_actions,
         }
 
     def critic_loss(self, batch, grad_params, rng):
-        """Compute a TD loss using the best of K next-action candidates."""
+        """Compute TD loss with the highest-density next-action candidate."""
         rng, sample_rng = jax.random.split(rng)
         next_candidates = self._generate_candidates(
             batch['next_observations'],
@@ -132,8 +328,9 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'q_mean': q.mean(),
             'q_max': q.max(),
             'q_min': q.min(),
-            'next_candidate_score_mean': next_candidates['scores'].mean(),
-            'next_best_score_mean': next_candidates['scores'].max(axis=-1).mean(),
+            'next_candidate_logprob_mean': next_candidates['logprobs'].mean(),
+            'next_best_logprob_mean': next_candidates['logprobs'].max(axis=-1).mean(),
+            'next_candidate_q_mean': next_candidates['q_scores'].mean(),
         }
 
     def actor_loss(self, batch, grad_params, rng):
@@ -178,7 +375,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             jnp.square(candidates['raw_actions'] - dataset_actions)
         )
 
-        # Only the conservatively selected candidate receives actor Q guidance.
+        # Only the behavior-density-selected candidate receives Q guidance.
         selected_qs = self.network.select('critic')(
             batch['observations'],
             actions=candidates['best_actions'],
@@ -205,9 +402,16 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'q_loss': q_loss,
             'q': selected_q.mean(),
             'mse': policy_mse,
-            'candidate_score_mean': candidates['scores'].mean(),
-            'best_score_mean': candidates['scores'].max(axis=-1).mean(),
+            'candidate_logprob_mean': candidates['logprobs'].mean(),
+            'best_logprob_mean': candidates['logprobs'].max(axis=-1).mean(),
+            'candidate_q_mean': candidates['q_scores'].mean(),
         }
+
+    @jax.jit
+    def bc_total_loss(self, batch, grad_params, rng=None):
+        """Compute the first-stage behavior-flow loss."""
+        rng = rng if rng is not None else self.rng
+        return self.bc_loss(batch, grad_params, rng)
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
@@ -247,8 +451,22 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
-    def update(self, batch):
-        """Update the multi-candidate actor, critic, and state flow."""
+    def _update_bc(self, batch):
+        """Run one behavior-flow pretraining update."""
+        new_rng, rng = jax.random.split(self.rng)
+
+        def loss_fn(grad_params):
+            return self.bc_total_loss(batch, grad_params, rng=rng)
+
+        new_bc_network, info = self.bc_network.apply_loss_fn(
+            loss_fn=loss_fn
+        )
+        info['training/phase'] = jnp.array(0.0)
+        return self.replace(bc_network=new_bc_network, rng=new_rng), info
+
+    @jax.jit
+    def _update_actor_critic(self, batch):
+        """Update the actor, critic, and state flow with frozen BCFlow."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
@@ -256,11 +474,18 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'critic')
+        info['training/phase'] = jnp.array(1.0)
         return self.replace(network=new_network, rng=new_rng), info
+
+    def update(self, batch):
+        """Automatically run BCFlow pretraining before actor-critic training."""
+        if int(self.bc_network.step) <= self.config['bc_steps']:
+            return self._update_bc(batch)
+        return self._update_actor_critic(batch)
 
     @jax.jit
     def sample_actions(self, observations, seed=None, temperature=1.0):
-        """Return the best of K batch-generated state-action candidates."""
+        """Return the candidate with the largest behavior log-density."""
         del temperature
         candidates = self._generate_candidates(observations, seed=seed)
         return candidates['best_actions']
@@ -290,9 +515,9 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
-        """Create the original PGFQL networks with candidate batching."""
+        """Create PGFQL candidate networks and a separate behavior flow."""
         rng = jax.random.PRNGKey(seed)
-        rng, init_rng = jax.random.split(rng, 2)
+        rng, init_rng, bc_init_rng = jax.random.split(rng, 3)
 
         ex_times = ex_actions[..., :1]
         ob_dims = ex_observations.shape[1:]
@@ -304,6 +529,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             encoders['critic'] = encoder_module()
             encoders['state_stitch'] = encoder_module()
             encoders['actor_onestep_flow'] = encoder_module()
+            encoders['bc_flow'] = encoder_module()
 
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
@@ -357,11 +583,48 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         )
 
         network.params['modules_target_critic'] = network.params['modules_critic']
+
+        bc_flow_def = ActorVectorField(
+            hidden_dims=config['bc_hidden_dims'],
+            action_dim=action_dim,
+            layer_norm=config['bc_layer_norm'],
+            encoder=encoders.get('bc_flow'),
+        )
+        bc_network_info = {
+            'bc_flow': (
+                bc_flow_def,
+                (ex_observations, ex_actions, ex_times),
+            ),
+        }
+        if encoders.get('bc_flow') is not None:
+            bc_network_info['bc_flow_encoder'] = (
+                encoders['bc_flow'],
+                (ex_observations,),
+            )
+        bc_networks = {
+            key: value[0] for key, value in bc_network_info.items()
+        }
+        bc_network_args = {
+            key: value[1] for key, value in bc_network_info.items()
+        }
+        bc_network_def = ModuleDict(bc_networks)
+        bc_network_tx = optax.adam(learning_rate=config['lr_bc'])
+        bc_network_params = bc_network_def.init(
+            bc_init_rng,
+            **bc_network_args,
+        )['params']
+        bc_network = TrainState.create(
+            bc_network_def,
+            bc_network_params,
+            tx=bc_network_tx,
+        )
+
         config['ob_dims'] = ob_dims
         config['action_dim'] = action_dim
         return cls(
             rng,
             network=network,
+            bc_network=bc_network,
             config=flax.core.FrozenDict(**config),
         )
 
@@ -373,17 +636,23 @@ def get_config():
             ob_dims=ml_collections.config_dict.placeholder(list),
             action_dim=ml_collections.config_dict.placeholder(int),
             lr=3e-4,
+            lr_bc=3e-4,
             batch_size=256,
             actor_hidden_dims=(512, 512, 512, 512),
             value_hidden_dims=(512, 512, 512, 512),
+            bc_hidden_dims=(512, 512, 512, 512),
             layer_norm=True,
             actor_layer_norm=False,
+            bc_layer_norm=False,
             discount=0.99,
             tau=0.005,
             q_agg='mean',
             alpha=10.0,
             num_candidates=4,
+            bc_steps=100000,
             flow_steps=10,
+            logp_method='exact',
+            logp_hutch_probes=1,
             normalize_q_loss=False,
             encoder=ml_collections.config_dict.placeholder(str),
         )
