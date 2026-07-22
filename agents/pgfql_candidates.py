@@ -1,5 +1,4 @@
 import copy
-from functools import partial
 from typing import Any
 
 import flax
@@ -10,82 +9,22 @@ import optax
 
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import (
-    ConditionalActorVectorField,
-    NextStateVectorField,
-    Value,
-)
+from utils.networks import ActorVectorField, Value, ConditionalActorVectorField, NextStateVectorField
 
 
 class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
-    """PGFQL with transition-density-weighted state candidates.
+    """PGFQL with a log-density-weighted multi-candidate critic target.
 
-    A state behavior flow p_beta(s' | s) is pretrained separately and then
-    frozen.  The actor and environment rollout retain the original PGFQL
-    single-state, single-action policy.  Only the critic uses K vectorized
-    candidates: their state log densities define a temperature-softmax Bellman
-    target, and a FAC-style penalty lowers Q for candidates whose transition
-    density is below that of the corresponding dataset transition.
+    The actor, state-flow training, rollout policy, and network structure are
+    identical to the original PGFQL agent.  Only the critic target changes:
+    it samples K state-action candidates in parallel and averages their target
+    Q values with a softmax over log p_beta(s' | s).
     """
 
     rng: Any
     network: Any
-    state_network: Any
     config: Any = nonpytree_field()
 
-    # ------------------------------------------------------------------
-    # Stage 1: state behavior flow p_beta(s' | s)
-    # ------------------------------------------------------------------
-    def state_flow_loss(self, batch, grad_params, rng):
-        """Train p_beta(s' | s) with conditional flow matching."""
-        batch_size = batch['observations'].shape[0]
-        rng, noise_rng, time_rng = jax.random.split(rng, 3)
-
-        state_noises = jax.random.normal(
-            noise_rng,
-            batch['next_observations'].shape,
-        )
-        target_next_observations = batch['next_observations']
-        times = jax.random.uniform(time_rng, (batch_size, 1))
-        interpolated_states = (
-            (1 - times) * state_noises
-            + times * target_next_observations
-        )
-        target_velocity = target_next_observations - state_noises
-        predicted_velocity = self.state_network.select('state_flow')(
-            batch['observations'],
-            interpolated_states,
-            times,
-            params=grad_params,
-        )
-        loss = jnp.mean(jnp.square(predicted_velocity - target_velocity))
-        return loss, {'state_flow/loss': loss}
-
-    @jax.jit
-    def state_total_loss(self, batch, grad_params, rng=None):
-        """Compute the first-stage state-flow loss."""
-        rng = rng if rng is not None else self.rng
-        return self.state_flow_loss(batch, grad_params, rng)
-
-    @jax.jit
-    def update_state_flow(self, batch):
-        """Run one state behavior-flow pretraining update."""
-        new_rng, rng = jax.random.split(self.rng)
-
-        def loss_fn(grad_params):
-            return self.state_total_loss(batch, grad_params, rng=rng)
-
-        new_state_network, info = self.state_network.apply_loss_fn(
-            loss_fn=loss_fn
-        )
-        return self.replace(
-            state_network=new_state_network,
-            rng=new_rng,
-        ), info
-
-    # ------------------------------------------------------------------
-    # State-flow log density while sampling
-    # ------------------------------------------------------------------
     @staticmethod
     def make_divergence_exact(velocity_apply):
         """Return an exact divergence evaluator for a state vector field."""
@@ -146,17 +85,14 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
         return jax.vmap(single_divergence, in_axes=(0, 0, 0, 0))
 
-    def _sample_next_states_with_logprob(
+    def sample_next_state_candidates_with_logprob(
         self,
         observations,
         seed,
-        compute_logprob=True,
-        num_candidates=None,
     ):
-        """Sample K next states and optionally integrate log densities."""
-        if num_candidates is None:
-            num_candidates = self.config['num_candidates']
+        """Sample K next states and integrate their conditional log density."""
         state_seed, divergence_seed = jax.random.split(seed)
+        num_candidates = self.config['num_candidates']
         observation_ndim = len(self.config['ob_dims'])
         batch_shape = observations.shape[:-observation_ndim]
         candidate_axis = len(batch_shape)
@@ -169,34 +105,31 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             jnp.expand_dims(observations, axis=candidate_axis),
             candidate_shape,
         )
+        base_states = jax.random.normal(state_seed, candidate_shape)
 
-        state_dim = self.config['state_dim']
+        state_dim = base_states.shape[-1]
         flat_observations = jnp.reshape(
             candidate_observations,
             (-1, state_dim),
         )
-        base_states = jax.random.normal(state_seed, candidate_shape)
         flat_states = jnp.reshape(base_states, (-1, state_dim))
 
         if self.config['encoder'] is not None:
-            encoded_observations = self.state_network.select(
-                'state_flow_encoder'
+            encoded_observations = self.network.select(
+                'actor_bc_flow_encoder'
             )(flat_observations)
         else:
             encoded_observations = flat_observations
 
         def velocity_apply(observation_batch, state_batch, time_batch):
-            return self.state_network.select('state_flow')(
+            return self.network.select('state_stitch')(
                 observation_batch,
                 state_batch,
                 time_batch,
                 is_encoded=True,
             )
 
-        if not compute_logprob:
-            divergence_fn = None
-            divergence_keys = None
-        elif self.config['logp_method'] == 'exact':
+        if self.config['logp_method'] == 'exact':
             divergence_fn = self.make_divergence_exact(velocity_apply)
             divergence_keys = None
         elif self.config['logp_method'] in ('hutch-rade', 'hutch-gaus'):
@@ -215,19 +148,14 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             )
         else:
             raise ValueError(
-                f'Unknown log-density mode: {self.config["logp_method"]}'
+                f'Unknown log-density method: '
+                f'{self.config["logp_method"]}'
             )
 
-        if compute_logprob:
-            state_logprob = (
-                -0.5 * jnp.sum(jnp.square(flat_states), axis=-1)
-                - 0.5 * state_dim * jnp.log(2 * jnp.pi)
-            )
-        else:
-            state_logprob = jnp.zeros(
-                (flat_states.shape[0],),
-                dtype=flat_states.dtype,
-            )
+        state_logprob = (
+            -0.5 * jnp.sum(jnp.square(flat_states), axis=-1)
+            - 0.5 * state_dim * jnp.log(2 * jnp.pi)
+        )
         step_size = 1.0 / self.config['flow_steps']
 
         def forward_euler_step(step, carry):
@@ -242,9 +170,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
                 states,
                 times,
             )
-            if divergence_fn is None:
-                divergences = jnp.zeros_like(logprob)
-            elif divergence_keys is None:
+            if divergence_keys is None:
                 divergences = divergence_fn(
                     encoded_observations,
                     states,
@@ -268,165 +194,55 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             forward_euler_step,
             (flat_states, state_logprob),
         )
-        next_states = jnp.reshape(flat_next_states, candidate_shape)
-        logprobs = jnp.reshape(
+        candidate_next_states = jnp.reshape(
+            flat_next_states,
+            candidate_shape,
+        )
+        candidate_logprobs = jnp.reshape(
             flat_logprobs,
             (*batch_shape, num_candidates),
         )
-        return candidate_observations, next_states, logprobs
-
-    @partial(jax.jit, static_argnames=('mode',))
-    def logprob_given_next_states(
-        self,
-        observations,
-        next_observations_final,
-        rng=None,
-        mode='hutch-rade',
-    ):
-        """Evaluate log p_beta(s' | s) for dataset transitions."""
-        leading_shape = next_observations_final.shape[:-1]
-        state_dim = next_observations_final.shape[-1]
-        flat_observations = jnp.reshape(
-            observations,
-            (-1, state_dim),
-        )
-        flat_next_observations = jnp.reshape(
-            next_observations_final,
-            (-1, state_dim),
+        return (
+            candidate_observations,
+            candidate_next_states,
+            candidate_logprobs,
         )
 
-        if self.config['encoder'] is not None:
-            encoded_observations = self.state_network.select(
-                'state_flow_encoder'
-            )(flat_observations)
-        else:
-            encoded_observations = flat_observations
-
-        def velocity_apply(observation_batch, state_batch, time_batch):
-            return self.state_network.select('state_flow')(
-                observation_batch,
-                state_batch,
-                time_batch,
-                is_encoded=True,
-            )
-
-        if mode == 'exact':
-            divergence_fn = self.make_divergence_exact(velocity_apply)
-            divergence_keys = None
-        elif mode in ('hutch-rade', 'hutch-gaus'):
-            if rng is None:
-                raise ValueError('rng is required for Hutchinson divergence')
-            divergence_fn = self.make_divergence_hutchinson(
-                velocity_apply,
-                probes=self.config['logp_hutch_probes'],
-                gaussian=(mode == 'hutch-gaus'),
-            )
-            divergence_keys = jax.random.split(
-                rng,
-                self.config['flow_steps']
-                * flat_next_observations.shape[0],
-            ).reshape(
-                self.config['flow_steps'],
-                flat_next_observations.shape[0],
-                2,
-            )
-        else:
-            raise ValueError(f'Unknown log-density mode: {mode}')
-
-        step_size = 1.0 / self.config['flow_steps']
-        accumulated_divergence = jnp.zeros(
-            (flat_next_observations.shape[0],),
-            dtype=flat_next_observations.dtype,
-        )
-
-        def reverse_euler_step(step, carry):
-            states, log_divergence = carry
-            time = (self.config['flow_steps'] - step) / self.config[
-                'flow_steps'
-            ]
-            times = jnp.full(
-                (states.shape[0], 1),
-                time,
-                dtype=states.dtype,
-            )
-            velocities = velocity_apply(
-                encoded_observations,
-                states,
-                times,
-            )
-            if divergence_keys is None:
-                divergences = divergence_fn(
-                    encoded_observations,
-                    states,
-                    times[:, 0],
-                )
-            else:
-                divergences = divergence_fn(
-                    encoded_observations,
-                    states,
-                    times[:, 0],
-                    divergence_keys[step],
-                )
-            return (
-                states - velocities * step_size,
-                log_divergence + divergences * step_size,
-            )
-
-        base_states, accumulated_divergence = jax.lax.fori_loop(
-            0,
-            self.config['flow_steps'],
-            reverse_euler_step,
-            (flat_next_observations, accumulated_divergence),
-        )
-        base_logprob = (
-            -0.5 * jnp.sum(jnp.square(base_states), axis=-1)
-            - 0.5 * state_dim * jnp.log(2 * jnp.pi)
-        )
-        logprob = base_logprob - accumulated_divergence
-        return jnp.reshape(logprob, leading_shape)
-
-    def _generate_candidates(
-        self,
-        observations,
-        seed,
-        actor_params=None,
-        compute_logprob=True,
-        num_candidates=None,
-    ):
-        """Generate K state-action candidates and state-support weights."""
-        if num_candidates is None:
-            num_candidates = self.config['num_candidates']
-        state_seed, action_seed = jax.random.split(seed)
+    def critic_loss(self, batch, grad_params, rng):
+        """Compute the logp-softmax multi-candidate critic loss."""
+        state_rng, action_rng = jax.random.split(rng)
         (
             candidate_observations,
-            candidate_next_observations,
+            candidate_next_states,
             candidate_logprobs,
-        ) = self._sample_next_states_with_logprob(
-            observations,
-            seed=state_seed,
-            compute_logprob=compute_logprob,
-            num_candidates=num_candidates,
+        ) = self.sample_next_state_candidates_with_logprob(
+            batch['next_observations'],
+            seed=state_rng,
         )
 
-        observation_ndim = len(self.config['ob_dims'])
-        batch_shape = observations.shape[:-observation_ndim]
         action_noises = jax.random.normal(
-            action_seed,
+            action_rng,
             (
-                *batch_shape,
-                num_candidates,
+                *batch['next_observations'].shape[:-1],
+                self.config['num_candidates'],
                 self.config['action_dim'],
             ),
         )
-        raw_candidate_actions = self.network.select(
-            'actor_onestep_flow'
-        )(
+        candidate_actions = self.network.select('actor_onestep_flow')(
             candidate_observations,
             action_noises,
-            candidate_next_observations,
-            params=actor_params,
+            candidate_next_states,
         )
-        candidate_actions = jnp.clip(raw_candidate_actions, -1, 1)
+        candidate_actions = jnp.clip(candidate_actions, -1, 1)
+
+        next_qs = self.network.select('target_critic')(
+            candidate_observations,
+            actions=candidate_actions,
+        )
+        if self.config['q_agg'] == 'min':
+            candidate_q = next_qs.min(axis=0)
+        else:
+            candidate_q = next_qs.mean(axis=0)
 
         centered_logprobs = candidate_logprobs - jnp.max(
             candidate_logprobs,
@@ -439,237 +255,114 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
                 axis=-1,
             )
         )
-        return {
-            'observations': candidate_observations,
-            'next_observations': candidate_next_observations,
-            'raw_actions': raw_candidate_actions,
-            'actions': candidate_actions,
-            'logprobs': candidate_logprobs,
-            'weights': candidate_weights,
-        }
+        next_q = jnp.sum(candidate_weights * candidate_q, axis=-1)
 
-    def _candidate_weight_metrics(self, candidates):
-        weights = candidates['weights']
-        entropy = -jnp.sum(
-            weights * jnp.log(weights + 1e-8),
+        target_q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_q
+
+        q = self.network.select('critic')(batch['observations'], actions=batch['actions'], params=grad_params)
+        critic_loss = jnp.square(q - target_q).mean()
+
+        weight_entropy = -jnp.sum(
+            candidate_weights * jnp.log(candidate_weights + 1e-8),
             axis=-1,
         )
-        return {
-            'state_logprob_mean': candidates['logprobs'].mean(),
-            'state_logprob_max': candidates['logprobs'].max(axis=-1).mean(),
-            'state_weight_max': weights.max(axis=-1).mean(),
-            'state_weight_min': weights.min(axis=-1).mean(),
-            'state_weight_entropy': entropy.mean(),
-        }
-
-    # ------------------------------------------------------------------
-    # Stage 2: Actor-Critic
-    # ------------------------------------------------------------------
-    def critic_loss(self, batch, grad_params, rng):
-        """Compute a weighted target and FAC-style state-density penalty."""
-        rng, target_rng, penalty_rng, penalty_logprob_rng = jax.random.split(
-            rng, 4
-        )
-
-        # Ten candidates are used only to estimate the next-state target.
-        next_candidates = self._generate_candidates(
-            batch['next_observations'],
-            seed=target_rng,
-        )
-        next_candidate_qs = self.network.select('target_critic')(
-            next_candidates['observations'],
-            actions=next_candidates['actions'],
-        )
-        if self.config['q_agg'] == 'min':
-            next_candidate_q = next_candidate_qs.min(axis=0)
-        else:
-            next_candidate_q = next_candidate_qs.mean(axis=0)
-        next_q = jnp.sum(
-            next_candidates['weights'] * next_candidate_q,
-            axis=-1,
-        )
-
-        target_q = (
-            batch['rewards']
-            + self.config['discount'] * batch['masks'] * next_q
-        )
-        q_data = self.network.select('critic')(
-            batch['observations'],
-            actions=batch['actions'],
-            params=grad_params,
-        )
-        td_loss = jnp.square(q_data - target_q).mean()
-
-        # FAC uses one policy sample per state for its critic penalty.  Both
-        # the generated transition and dataset transition are evaluated by the
-        # same reverse-ODE log-density estimator.  Dataset log densities are
-        # cached once after state-flow pretraining by main.py.
-        if self.config['fac_alpha'] > 0:
-            penalty_candidate = self._generate_candidates(
-                batch['observations'],
-                seed=penalty_rng,
-                compute_logprob=False,
-                num_candidates=1,
-            )
-            penalty_next_observation = penalty_candidate[
-                'next_observations'
-            ].squeeze(axis=-2)
-            penalty_action = penalty_candidate['actions'].squeeze(axis=-2)
-            penalty_transition_logprob = jax.lax.stop_gradient(
-                self.logprob_given_next_states(
-                    batch['observations'],
-                    penalty_next_observation,
-                    rng=penalty_logprob_rng,
-                    mode=self.config['logp_method'],
-                )
-            )
-            data_transition_logprob = jax.lax.stop_gradient(
-                batch['estimated_state_logp']
-            )
-            logprob_difference = (
-                penalty_transition_logprob - data_transition_logprob
-            )
-            penalty_weights = jax.lax.stop_gradient(
-                jnp.clip(
-                    jnp.where(
-                        logprob_difference < 0,
-                        -jnp.expm1(logprob_difference),
-                        0.0,
-                    ),
-                    0.0,
-                    self.config['penalty_weight_max'],
-                )
-            )
-            penalty_qs = self.network.select('critic')(
-                batch['observations'],
-                actions=penalty_action,
-                params=grad_params,
-            )
-            # Enforce a finite conservative margin between a low-density
-            # candidate and the corresponding dataset action.  The hinge
-            # stops contributing once the candidate Q is lower by the desired
-            # margin, so it cannot push Q values toward -infinity.
-            penalty_q_gaps = jax.nn.relu(
-                penalty_qs
-                - jax.lax.stop_gradient(q_data)
-                + self.config['penalty_margin']
-            )
-            critic_penalty = self.config['fac_alpha'] * jnp.mean(
-                penalty_weights[None, ...] * penalty_q_gaps
-            )
-        else:
-            data_transition_logprob = jnp.zeros_like(batch['rewards'])
-            penalty_transition_logprob = jnp.zeros_like(batch['rewards'])
-            penalty_weights = jnp.zeros_like(batch['rewards'])
-            penalty_q_gaps = jnp.zeros_like(q_data)
-            critic_penalty = jnp.array(0.0, dtype=td_loss.dtype)
-        critic_loss = td_loss + critic_penalty
-
-        metrics = {
+        return critic_loss, {
             'critic_loss': critic_loss,
-            'td_loss': td_loss,
-            'penalty': critic_penalty,
-            'penalty_weight_mean': penalty_weights.mean(),
-            'penalty_weight_max': penalty_weights.max(),
-            'penalty_active_rate': (penalty_weights > 0).astype(
-                jnp.float32
-            ).mean(),
-            'penalty_q_gap_mean': penalty_q_gaps.mean(),
-            'penalty_q_active_rate': (penalty_q_gaps > 0).astype(
-                jnp.float32
-            ).mean(),
-            'data_state_logprob_mean': data_transition_logprob.mean(),
-            'penalty_state_logprob_mean': (
-                penalty_transition_logprob.mean()
-            ),
-            'q_mean': q_data.mean(),
-            'q_max': q_data.max(),
-            'q_min': q_data.min(),
-            'next_candidate_q_mean': next_candidate_q.mean(),
+            'q_mean': q.mean(),
+            'q_max': q.max(),
+            'q_min': q.min(),
+            'next_candidate_q_mean': candidate_q.mean(),
             'next_weighted_q_mean': next_q.mean(),
+            'next_candidate_q_std': candidate_q.std(axis=-1).mean(),
+            'state_logprob_mean': candidate_logprobs.mean(),
+            'state_logprob_max': candidate_logprobs.max(axis=-1).mean(),
+            'state_weight_entropy': weight_entropy.mean(),
+            'state_weight_max': candidate_weights.max(axis=-1).mean(),
+            'state_weight_min': candidate_weights.min(axis=-1).mean(),
         }
-        metrics.update(self._candidate_weight_metrics(next_candidates))
-        return critic_loss, metrics
 
     def actor_loss(self, batch, grad_params, rng):
-        """Keep the original PGFQL one-state, one-action actor update."""
-        single_candidate = self._generate_candidates(
-            batch['observations'],
-            seed=rng,
-            actor_params=grad_params,
-            compute_logprob=False,
-            num_candidates=1,
-        )
-        raw_action = single_candidate['raw_actions'].squeeze(axis=-2)
-        action = single_candidate['actions'].squeeze(axis=-2)
+        """Compute the FQL actor loss."""
+        batch_size, action_dim = batch['actions'].shape
+        _, ob_dim = batch['observations'].shape
+        rng, x_rng, t_rng = jax.random.split(rng, 3)
 
-        distill_loss = jnp.mean(
-            jnp.square(raw_action - batch['actions'])
-        )
+        # next observation loss.
+        x_0 = jax.random.normal(x_rng, (batch_size, ob_dim))
+        x_1 = batch['next_observations']
+        t = jax.random.uniform(t_rng, (batch_size, 1))
+        x_t = (1 - t) * x_0 + t * x_1
+        vel = x_1 - x_0
+        pred = self.network.select("state_stitch")(batch['observations'], x_t, t, params=grad_params)
+        next_ob_flow_loss = jnp.mean((pred - vel) ** 2)
 
-        action_qs = self.network.select('critic')(
-            batch['observations'],
-            actions=action,
-        )
-        action_q = action_qs.mean(axis=0)
-        q_loss = -action_q.mean()
+        # action loss.
+        rng, noise_rng = jax.random.split(rng)
+        noises = jax.random.normal(noise_rng, (batch_size, ob_dim))
+        target_flow_next_ob = self.compute_flow_next_state(batch['observations'], noises=noises)
+        rng, action_noise_rng = jax.random.split(rng)
+        noises = jax.random.normal(action_noise_rng, (batch_size, action_dim))
+        # actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, batch['next_observations'], params=grad_params)
+        actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, target_flow_next_ob, params=grad_params)
+        distill_loss = jnp.mean((actor_actions - batch['actions']) ** 2)
+
+        # Q loss.
+        actor_actions = jnp.clip(actor_actions, -1, 1)
+        qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
+        q = jnp.mean(qs, axis=0)
+
+        q_loss = -q.mean()
         if self.config['normalize_q_loss']:
-            scale = jax.lax.stop_gradient(
-                1 / (jnp.abs(action_q).mean() + 1e-8)
-            )
-            q_loss = scale * q_loss
+            lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
+            q_loss = lam * q_loss
 
-        actor_loss = self.config['alpha'] * distill_loss + q_loss
-        action_mse = jnp.mean(jnp.square(action - batch['actions']))
+        # Total loss.
+        actor_loss = next_ob_flow_loss + self.config['alpha'] * distill_loss + q_loss
+
+        # Additional metrics for logging.
+        actions = self.sample_actions(batch['observations'], seed=rng)
+        mse = jnp.mean((actions - batch['actions']) ** 2)
 
         return actor_loss, {
             'actor_loss': actor_loss,
+            'next_ob_flow_loss': next_ob_flow_loss,
             'distill_loss': distill_loss,
             'q_loss': q_loss,
-            'q': action_q.mean(),
-            'mse': action_mse,
+            'q': q.mean(),
+            'mse': mse,
         }
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
-        """Compute the state-weighted multi-candidate PGFQL objective."""
+        """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
+
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
 
-        critic_loss, critic_info = self.critic_loss(
-            batch,
-            grad_params,
-            critic_rng,
-        )
-        for key, value in critic_info.items():
-            info[f'critic/{key}'] = value
+        critic_loss, critic_info = self.critic_loss(batch, grad_params, critic_rng)
+        for k, v in critic_info.items():
+            info[f'critic/{k}'] = v
 
-        actor_loss, actor_info = self.actor_loss(
-            batch,
-            grad_params,
-            actor_rng,
-        )
-        for key, value in actor_info.items():
-            info[f'actor/{key}'] = value
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        for k, v in actor_info.items():
+            info[f'actor/{k}'] = v
 
-        return critic_loss + actor_loss, info
+        loss = critic_loss + actor_loss
+        return loss, info
 
     def target_update(self, network, module_name):
-        """Soft-update a target network."""
+        """Update the target network."""
         new_target_params = jax.tree_util.tree_map(
-            lambda parameter, target_parameter: (
-                parameter * self.config['tau']
-                + target_parameter * (1 - self.config['tau'])
-            ),
-            network.params[f'modules_{module_name}'],
-            network.params[f'modules_target_{module_name}'],
+            lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
+            self.network.params[f'modules_{module_name}'],
+            self.network.params[f'modules_target_{module_name}'],
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
     def update(self, batch):
-        """Update the actor and critic; the state behavior flow stays frozen."""
+        """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
@@ -677,42 +370,90 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'critic')
+
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
-    def sample_actions(self, observations, seed=None, temperature=1.0):
-        """Keep rollout identical to the one-state, one-action policy."""
-        del temperature
-        single_candidate = self._generate_candidates(
-            observations,
-            seed=seed,
-            compute_logprob=False,
-            num_candidates=1,
+    def sample_actions(
+        self,
+        observations,
+        seed=None,
+        temperature=1.0,
+    ):
+        """Sample actions from the one-step policy."""
+        ob_seed, _ = jax.random.split(seed)
+
+        noises = jax.random.normal(
+            ob_seed,
+            (
+                *observations.shape[: -len(self.config['ob_dims'])],
+                *self.config['ob_dims'],
+            ),
         )
-        return single_candidate['actions'].squeeze(axis=-2)
+        target_flow_next_ob = self.compute_flow_next_state(observations, noises=noises)
+        action_seed, ob_seed = jax.random.split(ob_seed)
+
+        noises = jax.random.normal(
+            action_seed,
+            (
+                *observations.shape[: -len(self.config['ob_dims'])],
+                self.config['action_dim'],
+            ),
+        )
+        actions = self.network.select('actor_onestep_flow')(observations, noises, target_flow_next_ob)
+        actions = jnp.clip(actions, -1, 1)
+        return actions
+
+    @jax.jit
+    def compute_flow_next_state(
+        self,
+        observations,
+        noises,
+    ):
+        """Compute actions from the BC flow model using the Euler method."""
+        if self.config['encoder'] is not None:
+            observations = self.network.select('actor_bc_flow_encoder')(observations)
+        next_state = noises
+        # Euler method.
+        for i in range(self.config['flow_steps']):
+            t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
+            vels = self.network.select('state_stitch')(observations, next_state, t, is_encoded=True)
+            next_state = next_state + vels / self.config['flow_steps']
+        return next_state
 
     @classmethod
-    def create(cls, seed, ex_observations, ex_actions, config):
-        """Create Actor-Critic networks and a separate state behavior flow."""
-        if config['state_temperature'] <= 0:
-            raise ValueError('state_temperature must be positive')
-        if config['num_candidates'] < 1:
-            raise ValueError('num_candidates must be at least 1')
+    def create(
+        cls,
+        seed,
+        ex_observations,
+        ex_actions,
+        config,
+    ):
+        """Create a new agent.
 
+        Args:
+            seed: Random seed.
+            ex_observations: Example batch of observations.
+            ex_actions: Example batch of actions.
+            config: Configuration dictionary.
+        """
         rng = jax.random.PRNGKey(seed)
-        rng, init_rng, state_init_rng = jax.random.split(rng, 3)
+        rng, init_rng = jax.random.split(rng, 2)
 
         ex_times = ex_actions[..., :1]
         ob_dims = ex_observations.shape[1:]
         action_dim = ex_actions.shape[-1]
 
-        encoders = {}
+
+        # Define encoders.
+        encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
             encoders['critic'] = encoder_module()
+            encoders['actor_bc_flow'] = encoder_module()
             encoders['actor_onestep_flow'] = encoder_module()
-            encoders['state_flow'] = encoder_module()
 
+        # Define networks.
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
@@ -725,108 +466,68 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             layer_norm=config['actor_layer_norm'],
             encoder=encoders.get('actor_onestep_flow'),
         )
-        network_info = {
-            'critic': (critic_def, (ex_observations, ex_actions)),
-            'target_critic': (
-                copy.deepcopy(critic_def),
-                (ex_observations, ex_actions),
-            ),
-            'actor_onestep_flow': (
-                actor_onestep_flow_def,
-                (ex_observations, ex_actions, ex_observations),
-            ),
-        }
-        networks = {key: value[0] for key, value in network_info.items()}
-        network_args = {key: value[1] for key, value in network_info.items()}
+        # actor_onestep_flow_def = ActorVectorField(
+        #     hidden_dims=config['actor_hidden_dims'],
+        #     action_dim=action_dim,
+        #     layer_norm=config['actor_layer_norm'],
+        #     encoder=encoders.get('actor_onestep_flow'),
+        # )
+
+        state_stitch_def = NextStateVectorField(
+            hidden_dims=config['actor_hidden_dims'],
+            state_dim=ob_dims,
+            layer_norm=config['actor_layer_norm'],
+            encoder=encoders.get('actor_bc_flow'),
+        )
+
+        network_info = dict(
+            critic=(critic_def, (ex_observations, ex_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_actions)),
+            actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, ex_actions, ex_observations)),
+            state_stitch=(state_stitch_def, (ex_observations, ex_observations, ex_times)),
+        )
+        if encoders.get('actor_onestep_flow') is not None:
+            # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
+            network_info['actor_onestep_flow_encoder'] = (encoders.get('actor_onestep_flow'), (ex_observations,))
+        networks = {k: v[0] for k, v in network_info.items()}
+        network_args = {k: v[1] for k, v in network_info.items()}
+
         network_def = ModuleDict(networks)
         network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
-        network = TrainState.create(
-            network_def,
-            network_params,
-            tx=network_tx,
-        )
-        network.params['modules_target_critic'] = (
-            network.params['modules_critic']
-        )
+        network = TrainState.create(network_def, network_params, tx=network_tx)
 
-        state_flow_def = NextStateVectorField(
-            hidden_dims=config['state_hidden_dims'],
-            state_dim=ob_dims,
-            layer_norm=config['state_layer_norm'],
-            encoder=encoders.get('state_flow'),
-        )
-        state_network_info = {
-            'state_flow': (
-                state_flow_def,
-                (ex_observations, ex_observations, ex_times),
-            ),
-        }
-        if encoders.get('state_flow') is not None:
-            state_network_info['state_flow_encoder'] = (
-                encoders['state_flow'],
-                (ex_observations,),
-            )
-        state_networks = {
-            key: value[0] for key, value in state_network_info.items()
-        }
-        state_network_args = {
-            key: value[1] for key, value in state_network_info.items()
-        }
-        state_network_def = ModuleDict(state_networks)
-        state_network_tx = optax.adam(learning_rate=config['lr_state'])
-        state_network_params = state_network_def.init(
-            state_init_rng,
-            **state_network_args,
-        )['params']
-        state_network = TrainState.create(
-            state_network_def,
-            state_network_params,
-            tx=state_network_tx,
-        )
+        params = network.params
+        params['modules_target_critic'] = params['modules_critic']
 
         config['ob_dims'] = ob_dims
-        config['state_dim'] = ex_observations.shape[-1]
         config['action_dim'] = action_dim
-        return cls(
-            rng,
-            network=network,
-            state_network=state_network,
-            config=flax.core.FrozenDict(**config),
-        )
+        return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
 
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name='pgfql_candidates',
-            ob_dims=ml_collections.config_dict.placeholder(list),
-            state_dim=ml_collections.config_dict.placeholder(int),
-            action_dim=ml_collections.config_dict.placeholder(int),
-            lr=3e-4,
-            lr_state=3e-4,
-            batch_size=256,
-            actor_hidden_dims=(512, 512, 512, 512),
-            value_hidden_dims=(512, 512, 512, 512),
-            state_hidden_dims=(512, 512, 512, 512),
-            layer_norm=True,
-            actor_layer_norm=False,
-            state_layer_norm=False,
-            discount=0.99,
-            tau=0.005,
-            q_agg='mean',
-            alpha=1.0,
-            fac_alpha=0.1,
-            penalty_margin=5.0,
-            penalty_weight_max=0.5,
-            num_candidates=10,
-            state_flow_epochs=250,
-            state_temperature=10.0,
-            flow_steps=10,
-            logp_method='hutch-rade',
-            logp_hutch_probes=1,
-            normalize_q_loss=False,
-            encoder=ml_collections.config_dict.placeholder(str),
+            agent_name='pgfql_candidates',  # Agent name.
+            ob_dims=ml_collections.config_dict.placeholder(list),  # Observation dimensions (will be set automatically).
+            action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
+            lr=3e-4,  # Learning rate.
+            batch_size=256,  # Batch size.
+            actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
+            value_hidden_dims=(512, 512, 512, 512),  # Value network hidden dimensions.
+            layer_norm=True,  # Whether to use layer normalization.
+            actor_layer_norm=False,  # Whether to use layer normalization for the actor.
+            discount=0.99,  # Discount factor.
+            tau=0.005,  # Target network update rate.
+            q_agg='mean',  # Aggregation method for target Q values.
+            alpha=1.0,  # BC coefficient (overridden for selected AntMaze tasks in main.py).
+            num_candidates=10,  # Number of critic-target candidates.
+            state_temperature=10.0,  # Temperature for logp-softmax target weights.
+            flow_steps=10,  # Number of flow steps.
+            logp_method='hutch-rade',  # State-flow divergence estimator.
+            logp_hutch_probes=1,  # Number of Hutchinson trace probes.
+            normalize_q_loss=False,  # Whether to normalize the Q loss.
+            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
         )
     )
     return config

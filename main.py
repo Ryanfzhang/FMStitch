@@ -117,6 +117,7 @@ def main(_):
     # only Actor-Critic updates.  The state flow is frozen afterwards.
     if (
         config['agent_name'] == 'pgfql_candidates'
+        and config.get('state_flow_pretraining', False)
         and FLAGS.restore_path is None
     ):
         if 'visual' in FLAGS.env_name:
@@ -163,7 +164,8 @@ def main(_):
     # the reverse ODE is not recomputed during every critic update.
     if (
         config['agent_name'] == 'pgfql_candidates'
-        and config['fac_alpha'] > 0
+        and config.get('state_flow_pretraining', False)
+        and config.get('fac_alpha', 0) > 0
     ):
         def cache_state_logprobs(dataset, description, seed_offset):
             if dataset is None:
