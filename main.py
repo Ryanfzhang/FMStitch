@@ -143,10 +143,85 @@ def main(_):
             state_batch = train_dataset.sample(state_batch_size)
             agent, _ = agent.update_state_flow(state_batch)
 
+        if config['fac_alpha'] > 0:
+            print(
+                'Finished state behavior-flow pretraining: '
+                f'{config["state_flow_epochs"]} epochs, '
+                f'{state_steps} updates. '
+                'Preparing dataset transition log densities.'
+            )
+        else:
+            print(
+                'Finished state behavior-flow pretraining: '
+                f'{config["state_flow_epochs"]} epochs, '
+                f'{state_steps} updates. '
+                f'Actor-Critic will now run for {FLAGS.offline_steps} steps.'
+            )
+
+    # FAC-style state penalties compare a generated transition against the
+    # corresponding dataset transition.  Cache dataset log densities once so
+    # the reverse ODE is not recomputed during every critic update.
+    if (
+        config['agent_name'] == 'pgfql_candidates'
+        and config['fac_alpha'] > 0
+    ):
+        def cache_state_logprobs(dataset, description, seed_offset):
+            if dataset is None:
+                return
+
+            if 'visual' in FLAGS.env_name or dataset.size < 100000:
+                density_batch_size = config['batch_size']
+            else:
+                # Divergence estimation is substantially heavier than plain
+                # flow matching; cap this at 1024 for 11 GB GPUs.
+                density_batch_size = config['batch_size'] * 4
+
+            first_leaf = jax.tree_util.tree_leaves(dataset._dict)[0]
+            cached_logprobs = np.zeros(
+                (len(first_leaf),),
+                dtype=np.float32,
+            )
+            density_rng = jax.random.PRNGKey(FLAGS.seed + seed_offset)
+            for start in tqdm.tqdm(
+                range(0, dataset.size, density_batch_size),
+                smoothing=0.1,
+                dynamic_ncols=True,
+                desc=description,
+            ):
+                stop = min(start + density_batch_size, dataset.size)
+                indices = np.arange(start, stop)
+                density_batch = dataset.sample(
+                    len(indices),
+                    idxs=indices,
+                )
+                density_rng, logprob_rng = jax.random.split(density_rng)
+                logprobs = agent.logprob_given_next_states(
+                    density_batch['observations'],
+                    density_batch['next_observations'],
+                    rng=logprob_rng,
+                    mode=config['logp_method'],
+                )
+                cached_logprobs[indices] = np.asarray(logprobs)
+
+            dataset._dict['estimated_state_logp'] = cached_logprobs
+            valid_logprobs = cached_logprobs[: dataset.size]
+            print(
+                f'{description}: mean={valid_logprobs.mean():.6f}, '
+                f'min={valid_logprobs.min():.6f}, '
+                f'max={valid_logprobs.max():.6f}'
+            )
+
+        cache_state_logprobs(
+            train_dataset,
+            description='Cache train transition logp',
+            seed_offset=1001,
+        )
+        cache_state_logprobs(
+            val_dataset,
+            description='Cache validation transition logp',
+            seed_offset=2001,
+        )
         print(
-            'Finished state behavior-flow pretraining: '
-            f'{config["state_flow_epochs"]} epochs, '
-            f'{state_steps} updates. '
             f'Actor-Critic will now run for {FLAGS.offline_steps} steps.'
         )
 

@@ -467,9 +467,8 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
     # ------------------------------------------------------------------
     def critic_loss(self, batch, grad_params, rng):
         """Compute a weighted target and FAC-style state-density penalty."""
-        rng, target_rng, penalty_rng, data_logprob_rng = jax.random.split(
-            rng,
-            4,
+        rng, target_rng, penalty_rng, penalty_logprob_rng = jax.random.split(
+            rng, 4
         )
 
         # Ten candidates are used only to estimate the next-state target.
@@ -501,40 +500,55 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         )
         td_loss = jnp.square(q_data - target_q).mean()
 
-        # FAC-style penalty in transition space.  Compare every generated
-        # transition with the dataset transition under the same conditioning
-        # state, then lower Q only for less likely generated transitions.
-        penalty_candidates = self._generate_candidates(
-            batch['observations'],
-            seed=penalty_rng,
-        )
-        data_transition_logprob = jax.lax.stop_gradient(
-            self.logprob_given_next_states(
+        # FAC uses one policy sample per state for its critic penalty.  Both
+        # the generated transition and dataset transition are evaluated by the
+        # same reverse-ODE log-density estimator.  Dataset log densities are
+        # cached once after state-flow pretraining by main.py.
+        if self.config['fac_alpha'] > 0:
+            penalty_candidate = self._generate_candidates(
                 batch['observations'],
-                batch['next_observations'],
-                rng=data_logprob_rng,
-                mode=self.config['logp_method'],
+                seed=penalty_rng,
+                compute_logprob=False,
+                num_candidates=1,
             )
-        )
-        logprob_difference = (
-            penalty_candidates['logprobs']
-            - data_transition_logprob[..., None]
-        )
-        penalty_weights = jax.lax.stop_gradient(
-            jnp.where(
-                logprob_difference < 0,
-                -jnp.expm1(logprob_difference),
-                0.0,
+            penalty_next_observation = penalty_candidate[
+                'next_observations'
+            ].squeeze(axis=-2)
+            penalty_action = penalty_candidate['actions'].squeeze(axis=-2)
+            penalty_transition_logprob = jax.lax.stop_gradient(
+                self.logprob_given_next_states(
+                    batch['observations'],
+                    penalty_next_observation,
+                    rng=penalty_logprob_rng,
+                    mode=self.config['logp_method'],
+                )
             )
-        )
-        penalty_qs = self.network.select('critic')(
-            penalty_candidates['observations'],
-            actions=penalty_candidates['actions'],
-            params=grad_params,
-        )
-        critic_penalty = self.config['fac_alpha'] * jnp.mean(
-            penalty_weights[None, ...] * penalty_qs
-        )
+            data_transition_logprob = jax.lax.stop_gradient(
+                batch['estimated_state_logp']
+            )
+            logprob_difference = (
+                penalty_transition_logprob - data_transition_logprob
+            )
+            penalty_weights = jax.lax.stop_gradient(
+                jnp.where(
+                    logprob_difference < 0,
+                    -jnp.expm1(logprob_difference),
+                    0.0,
+                )
+            )
+            penalty_qs = self.network.select('critic')(
+                batch['observations'],
+                actions=penalty_action,
+                params=grad_params,
+            )
+            critic_penalty = self.config['fac_alpha'] * jnp.mean(
+                penalty_weights[None, ...] * penalty_qs
+            )
+        else:
+            data_transition_logprob = jnp.zeros_like(batch['rewards'])
+            penalty_transition_logprob = jnp.zeros_like(batch['rewards'])
+            penalty_weights = jnp.zeros_like(batch['rewards'])
+            critic_penalty = jnp.array(0.0, dtype=td_loss.dtype)
         critic_loss = td_loss + critic_penalty
 
         metrics = {
@@ -547,9 +561,9 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
                 jnp.float32
             ).mean(),
             'data_state_logprob_mean': data_transition_logprob.mean(),
-            'penalty_state_logprob_mean': penalty_candidates[
-                'logprobs'
-            ].mean(),
+            'penalty_state_logprob_mean': (
+                penalty_transition_logprob.mean()
+            ),
             'q_mean': q_data.mean(),
             'q_max': q_data.max(),
             'q_min': q_data.min(),
@@ -784,7 +798,7 @@ def get_config():
             tau=0.005,
             q_agg='mean',
             alpha=1.0,
-            fac_alpha=1.0,
+            fac_alpha=0.1,
             num_candidates=10,
             state_flow_epochs=250,
             state_temperature=10.0,
