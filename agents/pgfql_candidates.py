@@ -530,10 +530,14 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
                 penalty_transition_logprob - data_transition_logprob
             )
             penalty_weights = jax.lax.stop_gradient(
-                jnp.where(
-                    logprob_difference < 0,
-                    -jnp.expm1(logprob_difference),
+                jnp.clip(
+                    jnp.where(
+                        logprob_difference < 0,
+                        -jnp.expm1(logprob_difference),
+                        0.0,
+                    ),
                     0.0,
+                    self.config['penalty_weight_max'],
                 )
             )
             penalty_qs = self.network.select('critic')(
@@ -541,13 +545,21 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
                 actions=penalty_action,
                 params=grad_params,
             )
+            # Penalize a low-density candidate only while its Q value is
+            # higher than the corresponding dataset action's Q value.  The
+            # hinge makes this conservative term non-negative and prevents it
+            # from pushing already-conservative Q values toward -infinity.
+            penalty_q_gaps = jax.nn.relu(
+                penalty_qs - jax.lax.stop_gradient(q_data)
+            )
             critic_penalty = self.config['fac_alpha'] * jnp.mean(
-                penalty_weights[None, ...] * penalty_qs
+                penalty_weights[None, ...] * penalty_q_gaps
             )
         else:
             data_transition_logprob = jnp.zeros_like(batch['rewards'])
             penalty_transition_logprob = jnp.zeros_like(batch['rewards'])
             penalty_weights = jnp.zeros_like(batch['rewards'])
+            penalty_q_gaps = jnp.zeros_like(q_data)
             critic_penalty = jnp.array(0.0, dtype=td_loss.dtype)
         critic_loss = td_loss + critic_penalty
 
@@ -558,6 +570,10 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'penalty_weight_mean': penalty_weights.mean(),
             'penalty_weight_max': penalty_weights.max(),
             'penalty_active_rate': (penalty_weights > 0).astype(
+                jnp.float32
+            ).mean(),
+            'penalty_q_gap_mean': penalty_q_gaps.mean(),
+            'penalty_q_active_rate': (penalty_q_gaps > 0).astype(
                 jnp.float32
             ).mean(),
             'data_state_logprob_mean': data_transition_logprob.mean(),
@@ -798,7 +814,8 @@ def get_config():
             tau=0.005,
             q_agg='mean',
             alpha=1.0,
-            fac_alpha=0.1,
+            fac_alpha=0.01,
+            penalty_weight_max=0.5,
             num_candidates=10,
             state_flow_epochs=250,
             state_temperature=10.0,
