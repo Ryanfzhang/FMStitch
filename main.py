@@ -57,7 +57,7 @@ def main(_):
 
     # Set up logger.
     exp_name = "{}_{}_{}".format(FLAGS.agent["agent_name"], FLAGS.env_name, FLAGS.seed)
-    setup_wandb(project='pgfql_v5', group=FLAGS.run_group, name=exp_name)
+    setup_wandb(project='pgfql_v6', group=FLAGS.run_group, name=exp_name)
 
     exp_name = get_exp_name(FLAGS.seed)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
