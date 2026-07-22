@@ -545,12 +545,14 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
                 actions=penalty_action,
                 params=grad_params,
             )
-            # Penalize a low-density candidate only while its Q value is
-            # higher than the corresponding dataset action's Q value.  The
-            # hinge makes this conservative term non-negative and prevents it
-            # from pushing already-conservative Q values toward -infinity.
+            # Enforce a finite conservative margin between a low-density
+            # candidate and the corresponding dataset action.  The hinge
+            # stops contributing once the candidate Q is lower by the desired
+            # margin, so it cannot push Q values toward -infinity.
             penalty_q_gaps = jax.nn.relu(
-                penalty_qs - jax.lax.stop_gradient(q_data)
+                penalty_qs
+                - jax.lax.stop_gradient(q_data)
+                + self.config['penalty_margin']
             )
             critic_penalty = self.config['fac_alpha'] * jnp.mean(
                 penalty_weights[None, ...] * penalty_q_gaps
@@ -814,7 +816,8 @@ def get_config():
             tau=0.005,
             q_agg='mean',
             alpha=1.0,
-            fac_alpha=0.01,
+            fac_alpha=0.1,
+            penalty_margin=5.0,
             penalty_weight_max=0.5,
             num_candidates=10,
             state_flow_epochs=250,
