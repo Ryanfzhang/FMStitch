@@ -146,28 +146,18 @@ def main(_):
             state_batch = train_dataset.sample(state_batch_size)
             agent, _ = agent.update_state_flow(state_batch)
 
-        if config['fac_alpha'] > 0:
-            print(
-                'Finished state behavior-flow pretraining: '
-                f'{config["state_flow_epochs"]} epochs, '
-                f'{state_steps} updates. '
-                'Preparing dataset transition log densities.'
-            )
-        else:
-            print(
-                'Finished state behavior-flow pretraining: '
-                f'{config["state_flow_epochs"]} epochs, '
-                f'{state_steps} updates. '
-                f'Actor-Critic will now run for {FLAGS.offline_steps} steps.'
-            )
+        print(
+            'Finished state behavior-flow pretraining: '
+            f'{config["state_flow_epochs"]} epochs, '
+            f'{state_steps} updates.'
+        )
 
-    # FAC-style state penalties compare a generated transition against the
-    # corresponding dataset transition.  Cache dataset log densities once so
-    # the reverse ODE is not recomputed during every critic update.
+    # Cache the density of each dataset transition once.  The FAC-style
+    # penalty compares online policy candidates against these fixed
+    # per-transition behavior-density references.
     if (
         config['agent_name'] == 'pgfql_candidates'
-        and config.get('state_flow_pretraining', False)
-        and config.get('fac_alpha', 0) > 0
+        and config.get('state_fac_alpha', 0) > 0
     ):
         def cache_state_logprobs(dataset, description, seed_offset):
             if dataset is None:
@@ -176,8 +166,6 @@ def main(_):
             if 'visual' in FLAGS.env_name or dataset.size < 100000:
                 density_batch_size = config['batch_size']
             else:
-                # Divergence estimation is substantially heavier than plain
-                # flow matching; cap this at 1024 for 11 GB GPUs.
                 density_batch_size = config['batch_size'] * 4
 
             first_leaf = jax.tree_util.tree_leaves(dataset._dict)[0]
@@ -185,7 +173,9 @@ def main(_):
                 (len(first_leaf),),
                 dtype=np.float32,
             )
-            density_rng = jax.random.PRNGKey(FLAGS.seed + seed_offset)
+            density_rng = jax.random.PRNGKey(
+                FLAGS.seed + seed_offset
+            )
             for start in tqdm.tqdm(
                 range(0, dataset.size, density_batch_size),
                 smoothing=0.1,
@@ -198,7 +188,9 @@ def main(_):
                     len(indices),
                     idxs=indices,
                 )
-                density_rng, logprob_rng = jax.random.split(density_rng)
+                density_rng, logprob_rng = jax.random.split(
+                    density_rng
+                )
                 logprobs = agent.logprob_given_next_states(
                     density_batch['observations'],
                     density_batch['next_observations'],
@@ -225,8 +217,14 @@ def main(_):
             description='Cache validation transition logp',
             seed_offset=2001,
         )
+
+    if (
+        config['agent_name'] == 'pgfql_candidates'
+        and config.get('state_flow_pretraining', False)
+    ):
         print(
-            f'Actor-Critic will now run for {FLAGS.offline_steps} steps.'
+            f'Actor-Critic will now run for '
+            f'{FLAGS.offline_steps} steps.'
         )
 
     # Train agent.
