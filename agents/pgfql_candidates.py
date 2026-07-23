@@ -13,69 +13,28 @@ from utils.networks import ActorVectorField, Value, ConditionalActorVectorField,
 
 
 class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
-    """PGFQL with transition-induced conservative Q regularization.
+    """PGFQL with a random-successor conservative margin.
 
-    Candidate actions are induced by three successor-state proposals: the
-    paired dataset successor, samples from the learned state flow, and randomly
-    mismatched successors sampled from the batch marginal.
+    The actor and Bellman target are identical to the original PGFQL.  The
+    only additional critic term penalizes actions induced by randomly
+    mismatched successor states when their Q values exceed the dataset-action
+    Q values by more than the configured margin.
     """
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
-    def sample_cql_candidate_actions(self, batch, rng):
-        """Generate three groups of successor-conditioned CQL actions."""
-        (
-            state_rng,
-            data_action_rng,
-            behavior_action_rng,
-            random_state_rng,
-            random_action_rng,
-        ) = jax.random.split(rng, 5)
+    def sample_random_successor_actions(self, batch, rng):
+        """Generate actions conditioned on randomly mismatched successors."""
+        random_state_rng, random_action_rng = jax.random.split(rng)
         batch_size, observation_dim = batch['observations'].shape
-        num_samples = self.config['num_cql_samples']
+        num_samples = self.config['num_random_samples']
         action_dim = self.config['action_dim']
 
         repeated_observations = jnp.broadcast_to(
             batch['observations'][:, None, :],
             (batch_size, num_samples, observation_dim),
-        )
-        repeated_data_next_observations = jnp.broadcast_to(
-            batch['next_observations'][:, None, :],
-            (batch_size, num_samples, observation_dim),
-        )
-
-        # Actions conditioned on the paired dataset successor state.
-        data_action_noises = jax.random.normal(
-            data_action_rng,
-            (batch_size, num_samples, action_dim),
-        )
-        data_conditioned_actions = self.network.select(
-            'actor_onestep_flow'
-        )(
-            repeated_observations,
-            data_action_noises,
-            repeated_data_next_observations,
-        )
-
-        # Actions induced by plausible successors sampled from p_beta(s' | s).
-        state_noises = jax.random.normal(
-            state_rng,
-            (batch_size, num_samples, observation_dim),
-        )
-        behavior_next_observations = self.compute_flow_next_state(
-            repeated_observations,
-            noises=state_noises,
-        )
-        behavior_action_noises = jax.random.normal(
-            behavior_action_rng,
-            (batch_size, num_samples, action_dim),
-        )
-        behavior_actions = self.network.select('actor_onestep_flow')(
-            repeated_observations,
-            behavior_action_noises,
-            behavior_next_observations,
         )
 
         # Random stitching uses valid successor states sampled independently
@@ -100,22 +59,13 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             random_action_noises,
             random_next_observations,
         )
-
-        return {
-            'data': jax.lax.stop_gradient(
-                jnp.clip(data_conditioned_actions, -1, 1)
-            ),
-            'behavior': jax.lax.stop_gradient(
-                jnp.clip(behavior_actions, -1, 1)
-            ),
-            'random': jax.lax.stop_gradient(
-                jnp.clip(random_conditioned_actions, -1, 1)
-            ),
-        }
+        return jax.lax.stop_gradient(
+            jnp.clip(random_conditioned_actions, -1, 1)
+        )
 
     def critic_loss(self, batch, grad_params, rng):
-        """Compute the original TD loss plus a transition-induced CQL loss."""
-        target_rng, cql_rng = jax.random.split(rng)
+        """Compute original TD plus a random-successor hinge penalty."""
+        target_rng, penalty_rng = jax.random.split(rng)
 
         # Keep the original PGFQL one-sample Bellman target.
         next_actions = self.sample_actions(
@@ -139,63 +89,46 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         )
         td_loss = jnp.square(q - target_q).mean()
 
-        candidates = self.sample_cql_candidate_actions(batch, cql_rng)
-        candidate_actions = jnp.concatenate(
-            [
-                candidates['data'],
-                candidates['behavior'],
-                candidates['random'],
-            ],
-            axis=1,
+        random_actions = self.sample_random_successor_actions(
+            batch,
+            penalty_rng,
         )
-        total_candidates = candidate_actions.shape[1]
-        candidate_observations = jnp.broadcast_to(
+        random_observations = jnp.broadcast_to(
             batch['observations'][:, None, :],
             (
                 batch['observations'].shape[0],
-                total_candidates,
+                self.config['num_random_samples'],
                 batch['observations'].shape[-1],
             ),
         )
-        candidate_q = self.network.select('critic')(
-            candidate_observations,
-            actions=candidate_actions,
+        random_q = self.network.select('critic')(
+            random_observations,
+            actions=random_actions,
             params=grad_params,
         )
-        cql_temperature = self.config['cql_temperature']
-        candidate_logmeanexp = cql_temperature * (
-            jax.scipy.special.logsumexp(
-                candidate_q / cql_temperature,
-                axis=-1,
-            )
-            - jnp.log(total_candidates)
+        margin_violation = (
+            random_q
+            - q[..., None]
+            + self.config['random_penalty_margin']
         )
-        cql_gap = candidate_logmeanexp - q
-        cql_penalty = self.config['cql_alpha'] * cql_gap.mean()
-        critic_loss = td_loss + cql_penalty
-
-        num_samples = self.config['num_cql_samples']
-        data_candidate_q = candidate_q[..., :num_samples]
-        behavior_candidate_q = candidate_q[
-            ..., num_samples : 2 * num_samples
-        ]
-        random_candidate_q = candidate_q[..., 2 * num_samples :]
+        hinge_loss = jax.nn.relu(margin_violation).mean()
+        random_penalty = (
+            self.config['random_penalty_alpha'] * hinge_loss
+        )
+        critic_loss = td_loss + random_penalty
 
         return critic_loss, {
             'critic_loss': critic_loss,
             'td_loss': td_loss,
-            'cql_penalty': cql_penalty,
-            'cql_gap': cql_gap.mean(),
-            'cql_logmeanexp': candidate_logmeanexp.mean(),
-            'cql_data_conditioned_q': data_candidate_q.mean(),
-            'cql_behavior_q': behavior_candidate_q.mean(),
-            'cql_random_q': random_candidate_q.mean(),
-            'cql_candidate_q_max': candidate_q.max(axis=-1).mean(),
-            'cql_data_action_std': candidates['data'].std(axis=1).mean(),
-            'cql_behavior_action_std': candidates['behavior'].std(
-                axis=1
+            'random_penalty': random_penalty,
+            'random_hinge_loss': hinge_loss,
+            'random_margin_violation': margin_violation.mean(),
+            'random_penalty_active_fraction': (
+                margin_violation > 0
             ).mean(),
-            'cql_random_action_std': candidates['random'].std(
+            'random_successor_q': random_q.mean(),
+            'random_successor_q_max': random_q.max(axis=-1).mean(),
+            'random_successor_action_std': random_actions.std(
                 axis=1
             ).mean(),
             'q_mean': q.mean(),
@@ -218,25 +151,8 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         pred = self.network.select("state_stitch")(batch['observations'], x_t, t, params=grad_params)
         next_ob_flow_loss = jnp.mean((pred - vel) ** 2)
 
-        # Paired inverse-dynamics distillation: the dataset action is trained
-        # against the successor state that it actually produced.
-        rng, bc_action_rng = jax.random.split(rng)
-        bc_action_noises = jax.random.normal(
-            bc_action_rng,
-            (batch_size, action_dim),
-        )
-        bc_actions = self.network.select('actor_onestep_flow')(
-            batch['observations'],
-            bc_action_noises,
-            batch['next_observations'],
-            params=grad_params,
-        )
-        distill_loss = jnp.mean(
-            jnp.square(bc_actions - batch['actions'])
-        )
-
-        # The policy-Q term still uses a successor sampled from p_beta(s' | s)
-        # so training matches the one-successor rollout policy.
+        # Keep the original PGFQL actor: both distillation and Q improvement
+        # use the same successor sampled from the current state flow.
         rng, state_rng, policy_action_rng = jax.random.split(rng, 3)
         state_noises = jax.random.normal(
             state_rng,
@@ -255,6 +171,9 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             policy_action_noises,
             policy_next_observations,
             params=grad_params,
+        )
+        distill_loss = jnp.mean(
+            jnp.square(actor_actions - batch['actions'])
         )
 
         # Q loss.
@@ -475,9 +394,9 @@ def get_config():
             tau=0.005,  # Target network update rate.
             q_agg='mean',  # Aggregation method for target Q values.
             alpha=1.0,  # BC coefficient (overridden for selected AntMaze tasks in main.py).
-            num_cql_samples=4,  # Samples per successor-state proposal group.
-            cql_alpha=0.1,  # Weight of the transition-induced CQL penalty.
-            cql_temperature=1.0,  # Temperature of the CQL log-mean-exp.
+            num_random_samples=4,  # Randomly mismatched successors per state.
+            random_penalty_alpha=0.1,  # Random-successor hinge weight.
+            random_penalty_margin=1.0,  # Desired Q margin below dataset actions.
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
