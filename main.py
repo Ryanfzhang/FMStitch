@@ -57,7 +57,7 @@ def main(_):
 
     # Set up logger.
     exp_name = "{}_{}_{}".format(FLAGS.agent["agent_name"], FLAGS.env_name, FLAGS.seed)
-    setup_wandb(project='pgfql_v6', group=FLAGS.run_group, name=exp_name)
+    setup_wandb(project='pgfql_v7', group=FLAGS.run_group, name=exp_name)
 
     # Include the environment name to prevent parallel jobs with the same seed
     # and second-level timestamp from writing into the same local CSV files.
