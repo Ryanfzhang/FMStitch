@@ -59,7 +59,9 @@ def main(_):
     exp_name = "{}_{}_{}".format(FLAGS.agent["agent_name"], FLAGS.env_name, FLAGS.seed)
     setup_wandb(project='pgfql_v6', group=FLAGS.run_group, name=exp_name)
 
-    exp_name = get_exp_name(FLAGS.seed)
+    # Include the environment name to prevent parallel jobs with the same seed
+    # and second-level timestamp from writing into the same local CSV files.
+    exp_name = f'{FLAGS.env_name}_{get_exp_name(FLAGS.seed)}'
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
