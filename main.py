@@ -48,7 +48,11 @@ config_flags.DEFINE_config_file('agent', 'agents/pgfql.py', lock_config=False)
 def main(_):
     config = FLAGS.agent
     if config['agent_name'] == 'pgfql_candidates':
-        if 'medium-play' in FLAGS.env_name:
+        if 'umaze' in FLAGS.env_name:
+            config['alpha'] = 10.0
+        elif 'large-play' in FLAGS.env_name:
+            config['alpha'] = 3.0
+        elif 'medium-play' in FLAGS.env_name:
             config['alpha'] = 3.0
         elif 'medium-diverse' in FLAGS.env_name:
             config['alpha'] = 5.0
