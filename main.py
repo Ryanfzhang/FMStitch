@@ -55,7 +55,9 @@ def main(_):
         elif 'medium-play' in FLAGS.env_name:
             config['alpha'] = 3.0
         elif 'medium-diverse' in FLAGS.env_name:
-            config['alpha'] = 5.0
+            config['alpha'] = 4.0
+        elif 'large-diverse' in FLAGS.env_name:
+            config['alpha'] = 3.0
         else:
             config['alpha'] = 1.0
 
