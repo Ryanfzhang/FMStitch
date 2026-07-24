@@ -23,8 +23,8 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
     First pretrain and freeze p_beta(s' | s).  Actor training and rollout use
     the original one-successor PGFQL policy.  The critic target is a
     log-density-softmax weighted sum over K successor/action candidates.  A
-    FAC-style density weight conservatively lowers Q for low-density policy
-    candidates generated through p_beta(s' | s) and the action flow.
+    A density-gated hinge penalty lowers Q only when a low-density policy
+    candidate is valued above the corresponding dataset action.
     """
 
     rng: Any
@@ -449,7 +449,7 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
         }
 
     def critic_loss(self, batch, grad_params, rng):
-        """Compute the weighted target plus a state-density FAC penalty."""
+        """Compute the weighted target plus a density-gated hinge penalty."""
         target_rng, penalty_rng, penalty_logprob_rng = jax.random.split(
             rng, 3
         )
@@ -524,9 +524,15 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
                     self.config['state_fac_weight_max'],
                 )
             )
+            data_q_reference = jax.lax.stop_gradient(q)[..., None]
+            state_fac_q_gap = penalty_q - data_q_reference
+            state_fac_hinge = jax.nn.relu(state_fac_q_gap)
             state_fac_penalty = (
                 self.config['state_fac_alpha']
-                * jnp.mean(state_fac_weights[None, ...] * penalty_q)
+                * jnp.mean(
+                    state_fac_weights[None, ...]
+                    * state_fac_hinge
+                )
             )
         else:
             penalty_state_logprob = jnp.zeros(
@@ -540,6 +546,8 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             state_fac_weights = jnp.zeros_like(
                 penalty_state_logprob
             )
+            state_fac_q_gap = jnp.zeros_like(penalty_q)
+            state_fac_hinge = jnp.zeros_like(penalty_q)
             state_fac_penalty = jnp.array(0.0, dtype=td_loss.dtype)
 
         critic_loss = td_loss + state_fac_penalty
@@ -570,6 +578,12 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             'state_fac_active_fraction': (
                 state_fac_weights > 0
             ).mean(),
+            'state_fac_hinge_active_fraction': (
+                (state_fac_weights[None, ...] > 0)
+                & (state_fac_q_gap > 0)
+            ).mean(),
+            'state_fac_q_gap_mean': state_fac_q_gap.mean(),
+            'state_fac_hinge_mean': state_fac_hinge.mean(),
             'state_fac_logprob_difference': (
                 logprob_difference.mean()
             ),
@@ -834,7 +848,7 @@ def get_config():
             logp_method='hutch-rade',  # Divergence estimator for log density.
             logp_hutch_probes=1,  # Hutchinson probes per state and flow step.
             num_penalty_candidates=4,  # Policy candidates in state-FAC.
-            state_fac_alpha=0.1,  # State-density conservative coefficient.
+            state_fac_alpha=0.1,  # Density-gated Q hinge coefficient.
             state_fac_weight_max=1.0,  # Maximum density-derived weight.
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
