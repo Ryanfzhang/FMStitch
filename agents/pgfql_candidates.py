@@ -631,22 +631,18 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
             q_loss = lam * q_loss
 
-        q_scale = jax.lax.stop_gradient(
-            jnp.abs(q).mean() + 1e-6
-        )
-        dynamic_alpha = jnp.clip(
-            q_scale / self.config['alpha_scale'],
-            self.config['alpha_min'],
-            self.config['alpha_max'],
-        )
-        actor_loss = dynamic_alpha * distill_loss + q_loss
+        q_scale = jax.lax.stop_gradient(jnp.abs(q).mean())
+        actor_loss = self.config['alpha'] * distill_loss + q_loss
         mse = jnp.mean(
             jnp.square(actor_actions - batch['actions'])
         )
 
         return actor_loss, {
             'actor_loss': actor_loss,
-            'alpha': dynamic_alpha,
+            'alpha': jnp.asarray(
+                self.config['alpha'],
+                dtype=distill_loss.dtype,
+            ),
             'distill_loss': distill_loss,
             'q_loss': q_loss,
             'q': q.mean(),
@@ -736,15 +732,6 @@ class PGFQLCandidatesAgent(flax.struct.PyTreeNode):
             raise ValueError(
                 'num_penalty_candidates must be at least 1'
             )
-        if config['alpha_scale'] <= 0:
-            raise ValueError('alpha_scale must be positive')
-        if config['alpha_min'] <= 0:
-            raise ValueError('alpha_min must be positive')
-        if config['alpha_max'] < config['alpha_min']:
-            raise ValueError(
-                'alpha_max must be greater than or equal to alpha_min'
-            )
-
         rng = jax.random.PRNGKey(seed)
         rng, init_rng, state_init_rng = jax.random.split(rng, 3)
 
@@ -858,9 +845,7 @@ def get_config():
             discount=0.99,  # Discount factor.
             tau=0.005,  # Target network update rate.
             q_agg='mean',  # Aggregation method for target Q values.
-            alpha_scale=10.0,  # Divisor for the Q-scale adaptive BC coefficient.
-            alpha_min=1.0,  # Minimum adaptive BC coefficient.
-            alpha_max=10.0,  # Maximum adaptive BC coefficient.
+            alpha=4.0,  # Shared BC coefficient for all environments.
             state_flow_pretraining=True,  # Pretrain and freeze p_beta(s' | s).
             state_flow_epochs=250,  # Number of state-flow pretraining epochs.
             num_target_candidates=10,  # Candidates in the weighted TD target.
