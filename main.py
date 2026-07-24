@@ -47,19 +47,6 @@ config_flags.DEFINE_config_file('agent', 'agents/pgfql.py', lock_config=False)
 
 def main(_):
     config = FLAGS.agent
-    if config['agent_name'] == 'pgfql_candidates':
-        if 'umaze' in FLAGS.env_name:
-            config['alpha'] = 10.0
-        elif 'large-play' in FLAGS.env_name:
-            config['alpha'] = 3.0
-        elif 'medium-play' in FLAGS.env_name:
-            config['alpha'] = 3.0
-        elif 'medium-diverse' in FLAGS.env_name:
-            config['alpha'] = 4.0
-        elif 'large-diverse' in FLAGS.env_name:
-            config['alpha'] = 3.0
-        else:
-            config['alpha'] = 1.0
 
     # Set up logger.
     exp_name = "{}_{}_{}".format(FLAGS.agent["agent_name"], FLAGS.env_name, FLAGS.seed)
